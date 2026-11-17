@@ -4,6 +4,7 @@
 import json
 import os.path
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import hglib
@@ -73,6 +74,85 @@ def test_robustcheckout(monkeypatch):
     ]
 
 
+def test_cat_files(tmp_path):
+    """
+    Extract some files at a given revision without updating the working directory
+    """
+    repo_dir = tmp_path / "repo"
+    hglib.init(str(repo_dir))
+    repo = hglib.open(str(repo_dir))
+    (repo_dir / "dom" / "sub").mkdir(parents=True)
+    (repo_dir / "dom" / "sub" / "file.cpp").write_text("first version\n")
+    (repo_dir / "other.js").write_text("other\n")
+    _, first = repo.commit(message=b"first", user=b"test", addremove=True)
+    first = first.decode("utf-8")
+    (repo_dir / "dom" / "sub" / "file.cpp").write_text("second version\n")
+    repo.commit(message=b"second", user=b"test")
+
+    output_dir = tmp_path / "files"
+    mercurial.cat_files(
+        repo_dir=repo_dir,
+        revision=first,
+        # Directories and missing files are skipped
+        paths=["dom/sub/file.cpp", "dom", "missing.js"],
+        output_dir=output_dir,
+    )
+
+    assert sorted(
+        p.relative_to(output_dir) for p in output_dir.rglob("*") if p.is_file()
+    ) == [Path("dom/sub/file.cpp")]
+    assert (output_dir / "dom" / "sub" / "file.cpp").read_text() == "first version\n"
+
+    # No file found in that revision
+    mercurial.cat_files(
+        repo_dir=repo_dir,
+        revision=first,
+        paths=["missing.js"],
+        output_dir=tmp_path / "none",
+    )
+    assert not (tmp_path / "none").exists()
+
+    # Nothing to extract
+    mercurial.cat_files(
+        repo_dir=repo_dir, revision=first, paths=[], output_dir=tmp_path / "empty"
+    )
+    assert not (tmp_path / "empty").exists()
+
+
+def test_robust_clone_skips_update(monkeypatch, mock_mc):
+    """
+    The robust clone must not update the working directory, as it's
+    updated later on to the base revision of the patches, but it must
+    still purge untracked files left by a previous task
+    """
+    robust_checkout = MagicMock()
+    monkeypatch.setattr(mercurial, "robust_checkout", robust_checkout)
+
+    repo_dir = mock_mc.repo.root().decode("utf-8")
+    untracked = os.path.join(repo_dir, "untracked.txt")
+    with open(untracked, "w") as f:
+        f.write("leftover")
+
+    mock_mc.checkout_mode = "robust"
+    mercurial.MercurialRepository.clone(mock_mc)
+
+    robust_checkout.assert_called_once_with(
+        mock_mc.url,
+        mock_mc.dir,
+        mock_mc.share_base_dir,
+        branch=b"default",
+        noupdate=True,
+    )
+    assert not os.path.exists(untracked)
+
+
+LINT_EXTRA_PARAMS = {
+    "enable_always_target": False,
+    "optimize_target_tasks": True,
+    "target_tasks_method": "codereview",
+}
+
+
 def test_push_to_try(PhabricatorMock, mock_mc, responses):
     """
     Run mercurial worker on a single diff
@@ -108,7 +188,7 @@ def test_push_to_try(PhabricatorMock, mock_mc, responses):
     )
 
     worker = mercurial.MercurialWorker()
-    result = worker.run(mock_mc, build)
+    result = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was generated
     tip = mock_mc.repo.tip()
@@ -133,6 +213,7 @@ def test_push_to_try(PhabricatorMock, mock_mc, responses):
         "version": 2,
         "parameters": {
             "target_tasks_method": "codereview",
+            "enable_always_target": False,
             "optimize_target_tasks": True,
             "phabricator_diff": "PHID-HMBT-deadbeef",
         },
@@ -183,6 +264,8 @@ def test_push_to_try_existing_rev(PhabricatorMock, mock_mc):
         with open(readme, "a") as f:
             f.write(content)
         _, rev = mock_mc.repo.commit(message=content.encode("utf-8"), user=b"test")
+        # Simulate an upstream revision, public like it would be after a pull
+        mock_mc.repo.phase(rev, public=True)
         return rev
 
     # Make two commits, the first one is our base
@@ -209,7 +292,7 @@ def test_push_to_try_existing_rev(PhabricatorMock, mock_mc):
     assert not os.path.exists(config)
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(mock_mc, build)
+    mode, out_build, details = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was queued
     tip = mock_mc.repo.tip()
@@ -232,6 +315,7 @@ def test_push_to_try_existing_rev(PhabricatorMock, mock_mc):
         "version": 2,
         "parameters": {
             "target_tasks_method": "codereview",
+            "enable_always_target": False,
             "optimize_target_tasks": True,
             "phabricator_diff": "PHID-HMBT-deadbeef",
         },
@@ -315,7 +399,7 @@ def test_dont_push_skippable_files_to_try(PhabricatorMock, mock_mc):
     worker = mercurial.MercurialWorker(
         skippable_files=["test.txt"],
     )
-    mode, out_build, details = worker.run(mock_mc, build)
+    mode, out_build, details = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was queued
     tip = mock_mc.repo.tip()
@@ -386,7 +470,7 @@ def test_treeherder_link(PhabricatorMock, mock_mc):
     )
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(mock_mc, build)
+    mode, out_build, details = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was queued
     tip = mock_mc.repo.tip()
@@ -436,7 +520,7 @@ def test_failure_general(PhabricatorMock, mock_mc):
     mock_mc.apply_build = boom
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(mock_mc, build)
+    mode, out_build, details = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check the unit result was published
 
@@ -485,7 +569,7 @@ def test_failure_mercurial(PhabricatorMock, mock_config, mock_mc):
     )
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(mock_mc, build)
+    mode, out_build, details = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was queued
     assert mode == "fail:mercurial"
@@ -558,7 +642,7 @@ def test_push_to_try_nss(PhabricatorMock, mock_nss):
     )
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(mock_nss, build)
+    mode, out_build, details = worker.run(mock_nss, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was queued
     tip = mock_nss.repo.tip()
@@ -580,6 +664,7 @@ def test_push_to_try_nss(PhabricatorMock, mock_nss):
     assert json.load(open(config)) == {
         "version": 2,
         "parameters": {
+            "enable_always_target": False,
             "optimize_target_tasks": True,
             "phabricator_diff": "PHID-HMBT-deadbeef",
             "target_tasks_method": "codereview",
@@ -638,7 +723,7 @@ def test_crash_utf8_author(PhabricatorMock, mock_mc):
 
     # Run the mercurial worker on that patch only
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(mock_mc, build)
+    mode, out_build, details = worker.run(mock_mc, build, LINT_EXTRA_PARAMS)
 
     # Check we have the patch with utf-8 author properly applied
     assert [(c.author, c.desc) for c in mock_mc.repo.log()] == [
@@ -681,11 +766,11 @@ def test_unexpected_push_failure(PhabricatorMock, mock_mc):
     with PhabricatorMock as phab:
         phab.load_patches_stack(build)
 
-    from code_review_bot import mercurial
+    from code_review_bot import mercurial, vcs
 
-    mercurial.MAX_PUSH_RETRIES = 1
+    vcs.MAX_PUSH_RETRIES = 1
     mercurial.TRY_STATUS_URL = "http://test.status/try"
-    mercurial.PUSH_RETRY_EXPONENTIAL_DELAY = 0
+    vcs.PUSH_RETRY_EXPONENTIAL_DELAY = 0
     mercurial.TRY_STATUS_DELAY = 0
     mercurial.TRY_STATUS_MAX_WAIT = 0
 
@@ -693,7 +778,7 @@ def test_unexpected_push_failure(PhabricatorMock, mock_mc):
         "http://test.status/try", status=200, json={"result": {"status": "open"}}
     )
 
-    repository_mock = MagicMock(spec=mercurial.Repository)
+    repository_mock = MagicMock(spec=mercurial.MercurialRepository)
     repository_mock.push_to_try.side_effect = [
         hglib.error.CommandError(
             args=("push", "try_url"),
@@ -703,11 +788,12 @@ def test_unexpected_push_failure(PhabricatorMock, mock_mc):
         ),
         mock_mc.repo.tip(),
     ]
+    repository_mock.revision_id.side_effect = lambda tip: tip.node.decode("utf-8")
     repository_mock.try_name = "try"
     repository_mock.retries = 0
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(repository_mock, build)
+    mode, out_build, details = worker.run(repository_mock, build, LINT_EXTRA_PARAMS)
 
     assert mode == "success"
     assert out_build == build
@@ -743,11 +829,11 @@ def test_push_failure_max_retries(PhabricatorMock, mock_mc, monkeypatch):
     with PhabricatorMock as phab:
         phab.load_patches_stack(build)
 
-    from code_review_bot import mercurial
+    from code_review_bot import mercurial, vcs
 
-    mercurial.MAX_PUSH_RETRIES = 2
+    vcs.MAX_PUSH_RETRIES = 2
     mercurial.TRY_STATUS_URL = "http://test.status/try"
-    mercurial.PUSH_RETRY_EXPONENTIAL_DELAY = 2
+    vcs.PUSH_RETRY_EXPONENTIAL_DELAY = 2
     mercurial.TRY_STATUS_DELAY = 0
     mercurial.TRY_STATUS_MAX_WAIT = 0
 
@@ -755,7 +841,7 @@ def test_push_failure_max_retries(PhabricatorMock, mock_mc, monkeypatch):
         "http://test.status/try", status=200, json={"result": {"status": "open"}}
     )
 
-    repository_mock = MagicMock(spec=mercurial.Repository)
+    repository_mock = MagicMock(spec=mercurial.MercurialRepository)
     repository_mock.push_to_try.side_effect = hglib.error.CommandError(
         args=("push", "try_url"),
         ret=1,
@@ -764,7 +850,7 @@ def test_push_failure_max_retries(PhabricatorMock, mock_mc, monkeypatch):
     )
 
     worker = mercurial.MercurialWorker()
-    mode, out_build, details = worker.run(repository_mock, build)
+    mode, out_build, details = worker.run(repository_mock, build, LINT_EXTRA_PARAMS)
 
     # Check the treeherder link was queued
     assert build.retries == 3
@@ -799,11 +885,11 @@ def test_push_closed_try(PhabricatorMock, mock_mc, monkeypatch):
     with PhabricatorMock as phab:
         phab.load_patches_stack(build)
 
-    from code_review_bot import mercurial
+    from code_review_bot import mercurial, vcs
 
-    mercurial.MAX_PUSH_RETRIES = 2
+    vcs.MAX_PUSH_RETRIES = 2
     mercurial.TRY_STATUS_URL = "http://test.status/try"
-    mercurial.PUSH_RETRY_EXPONENTIAL_DELAY = 2
+    vcs.PUSH_RETRY_EXPONENTIAL_DELAY = 2
     mercurial.TRY_STATUS_DELAY = 42
     mercurial.TRY_STATUS_MAX_WAIT = 1
 
@@ -819,7 +905,7 @@ def test_push_closed_try(PhabricatorMock, mock_mc, monkeypatch):
         "http://test.status/try", status=200, json={"result": {"status": "open"}}
     )
 
-    repository_mock = MagicMock(spec=mercurial.Repository)
+    repository_mock = MagicMock(spec=mercurial.MercurialRepository)
     repository_mock.push_to_try.side_effect = [
         hglib.error.CommandError(
             args=("push", "try_url"),
@@ -829,12 +915,13 @@ def test_push_closed_try(PhabricatorMock, mock_mc, monkeypatch):
         ),
         mock_mc.repo.tip(),
     ]
+    repository_mock.revision_id.side_effect = lambda tip: tip.node.decode("utf-8")
     repository_mock.try_name = "try"
     repository_mock.retries = 0
 
     worker = mercurial.MercurialWorker()
 
-    mode, out_build, details = worker.run(repository_mock, build)
+    mode, out_build, details = worker.run(repository_mock, build, LINT_EXTRA_PARAMS)
     assert repository_mock.push_to_try.call_count == 2
 
     assert mode == "success"
@@ -896,3 +983,107 @@ def test_get_base_identifier_from_git(mock_mc):
     assert (
         mock_mc.get_base_identifier(stack) == "default"
     ), "`default` commit should be used when `use_latest_revision` is `True`."
+
+
+def test_get_base_identifier_converts_first_public_parent(mock_mc, monkeypatch):
+    stack = [
+        PhabricatorPatch(
+            1, "PHID-abc", "", "a" * 12, None, False, first_public_parent="c" * 12
+        )
+    ]
+    mock_mc.has_revision = lambda x: False
+    converted = []
+
+    def get_mercurial_base_hash(revision):
+        converted.append(revision)
+        return "d" * 40 if revision == "c" * 12 else None
+
+    monkeypatch.setattr(mock_mc, "get_mercurial_base_hash", get_mercurial_base_hash)
+
+    assert mock_mc.get_base_identifier(stack) == "d" * 40
+    assert converted == [
+        "a" * 12,
+        "c" * 12,
+    ]
+
+
+def test_get_base_identifier_falls_back_to_default(mock_mc, monkeypatch):
+    stack = [PhabricatorPatch(1, "PHID-abc", "", "a" * 12, None, False)]
+    mock_mc.has_revision = lambda x: False
+    monkeypatch.setattr(
+        mock_mc,
+        "get_mercurial_base_hash",
+        lambda x: None,
+    )
+
+    assert mock_mc.get_base_identifier(stack) == "default"
+
+
+def _setup_clean_repo(mock_mc, tmpdir):
+    """
+    Use a clone of the current state as remote, so local commits are outgoing
+    """
+    repo_dir = tmpdir.join("mozilla-central")
+    remote_dir = str(tmpdir.join("remote"))
+    hglib.clone(str(repo_dir).encode("utf-8"), remote_dir.encode("utf-8"))
+    repo_dir.join(".hg", "hgrc").write(
+        f"[paths]\ndefault = {remote_dir}\n[extensions]\nstrip =\n"
+    )
+    mock_mc._repo = hglib.open(str(repo_dir))
+    return repo_dir
+
+
+def _commit(repo, repo_dir, name):
+    path = repo_dir.join(name)
+    path.write(name)
+    repo.add(str(path).encode("utf-8"))
+    repo.commit(message=name.encode("utf-8"), user="test")
+    return repo.tip().node
+
+
+def test_clean_strips_drafts_without_backup(mock_mc, tmpdir):
+    """
+    Local drafts must be stripped without leaving a backup bundle behind
+    """
+    repo_dir = _setup_clean_repo(mock_mc, tmpdir)
+    public = mock_mc.repo.tip().node
+
+    assert _commit(mock_mc.repo, repo_dir, "draft.txt") != public
+
+    mock_mc.clean()
+
+    assert mock_mc.repo.tip().node == public
+    assert not repo_dir.join(".hg", "strip-backup").exists()
+
+
+def test_clean_keeps_public_outgoing_changesets(mock_mc, tmpdir):
+    """
+    Public changesets missing from the remote (e.g. pulled from another
+    repository sharing the same checkout) must not be stripped
+    """
+    repo_dir = _setup_clean_repo(mock_mc, tmpdir)
+
+    public = _commit(mock_mc.repo, repo_dir, "public.txt")
+    mock_mc.repo.phase(public, public=True)
+    _commit(mock_mc.repo, repo_dir, "draft.txt")
+
+    mock_mc.clean()
+
+    assert mock_mc.repo.tip().node == public
+    assert not repo_dir.join(".hg", "strip-backup").exists()
+
+
+def test_clean_strips_secret_changesets(mock_mc, tmpdir):
+    """
+    Secret changesets are local-only too, and must be stripped
+    """
+    repo_dir = _setup_clean_repo(mock_mc, tmpdir)
+    public = mock_mc.repo.tip().node
+
+    secret = _commit(mock_mc.repo, repo_dir, "secret.txt")
+    mock_mc.repo.phase(secret, secret=True, force=True)
+
+    mock_mc.clean()
+
+    assert mock_mc.repo.tip().node == public
+    assert not repo_dir.join(".hg", "strip-backup").exists()

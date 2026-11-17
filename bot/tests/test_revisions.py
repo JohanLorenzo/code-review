@@ -1,6 +1,7 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+import pytest
 import rs_parsepatch
 
 
@@ -136,7 +137,7 @@ def test_analyze_patch(mock_revision):
         def validates():
             return True
 
-        def as_phabricator_lint():
+        def as_phabricator_issue():
             return {}
 
     issue_in_new_file = MyIssue("new.txt", 1)
@@ -179,11 +180,11 @@ index 83db48f8..84275f99 100644
 
     mock_revision.analyze_patch()
     assert "new.txt" in mock_revision.lines
-    assert mock_revision.lines["new.txt"] == [1, 2, 3]
+    assert mock_revision.lines["new.txt"] == {1, 2, 3}
     assert "modified.txt" in mock_revision.lines
-    assert mock_revision.lines["modified.txt"] == [3]
+    assert mock_revision.lines["modified.txt"] == {3}
     assert "added.txt" in mock_revision.lines
-    assert mock_revision.lines["added.txt"] == [4]
+    assert mock_revision.lines["added.txt"] == {4}
     assert "new.txt" in mock_revision.files
     assert "modified.txt" in mock_revision.files
     assert "added.txt" in mock_revision.files
@@ -225,7 +226,30 @@ def test_revision_before_after(mock_config, mock_revision, mock_taskcluster_conf
     Ensure before/after feature is always run on specific revisions
     """
     mock_taskcluster_config.secrets["BEFORE_AFTER_RATIO"] = 0.5
-    mock_revision.id = 51
+    mock_revision.phabricator_id = 51
     assert mock_revision.before_after_feature is True
-    mock_revision.id = 42
+    mock_revision.phabricator_id = 42
     assert mock_revision.before_after_feature is False
+
+
+def test_revision_build_test(mock_config, mock_revision, mock_taskcluster_config):
+    mock_taskcluster_config.secrets["BUILD_TEST_ANALYSIS_RATIO"] = 0.5
+    mock_revision.phabricator_id = 1
+    assert mock_revision.build_test_feature is False
+    mock_revision.phabricator_id = 2
+    assert mock_revision.build_test_feature is True
+
+
+@pytest.mark.parametrize(
+    "secrets, expected",
+    [
+        ({}, False),
+        ({"BUILD_TEST_ANALYSIS_RATIO": 0}, False),
+        ({"BUILD_TEST_ANALYSIS_RATIO": 1}, True),
+    ],
+)
+def test_revision_build_test_ratio(
+    mock_config, mock_revision, mock_taskcluster_config, secrets, expected
+):
+    mock_taskcluster_config.secrets = secrets
+    assert mock_revision.build_test_feature is expected

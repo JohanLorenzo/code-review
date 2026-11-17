@@ -13,6 +13,8 @@ import uuid
 from collections import defaultdict, namedtuple
 from configparser import ConfigParser
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from textwrap import dedent
 from unittest.mock import MagicMock
 
 import hglib
@@ -20,10 +22,10 @@ import pytest
 import responses
 from libmozdata.phabricator import PhabricatorAPI
 
-from code_review_bot import Level, stats
+from code_review_bot import IssueType, Level, stats
 from code_review_bot.backend import BackendAPI
 from code_review_bot.config import GetAppUserAgent, settings
-from code_review_bot.mercurial import Repository
+from code_review_bot.mercurial import MercurialRepository
 from code_review_bot.sources.phabricator import (
     PhabricatorActions,
     PhabricatorBuild,
@@ -36,6 +38,16 @@ MOCK_DIR = os.path.join(os.path.dirname(__file__), "mocks")
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 
 MockArtifactResponse = namedtuple("MockArtifactResponse", "content")
+
+
+def _querydiffs_response(diff_id):
+    return json.dumps(
+        {
+            "error_code": None,
+            "error_info": None,
+            "result": {str(diff_id): {"properties": {}}},
+        }
+    )
 
 
 @pytest.fixture(scope="function")
@@ -65,6 +77,7 @@ def mock_config(mock_repositories):
     os.environ["TRY_TASK_ID"] = "remoteTryTask"
     os.environ["TRY_TASK_GROUP_ID"] = "remoteTryGroup"
     os.environ["BULK_ISSUE_CHUNKS"] = "10"
+    os.environ["ANALYSIS_MODE"] = "Lint"
     settings.setup(
         "test",
         ["dom/*", "tests/*.py", "test/*.c"],
@@ -82,6 +95,8 @@ def mock_issues(mock_task):
     task = mock_task(DefaultTask, "mock-analyzer")
 
     class MockIssue:
+        type_ = IssueType.Lint
+
         def __init__(self, nb):
             self.nb = nb
             self.path = "/path/to/file"
@@ -111,7 +126,13 @@ def mock_task():
     """Build configuration for any Analysis task"""
 
     def _build(cls, name):
-        return cls(f"{name}-ID", {"task": {"metadata": {"name": name}}, "status": {}})
+        return cls(
+            f"{name}-ID",
+            {
+                "task": {"metadata": {"name": name}},
+                "status": {"runs": [{"runId": 0}]},
+            },
+        )
 
     return _build
 
@@ -168,6 +189,18 @@ def mock_phabricator(mock_config):
 
         return (200, {"Content-Type": "application/json"}, content)
 
+    def query_diffs(request):
+        payload = dict(urllib.parse.parse_qsl(request.body))
+        assert "params" in payload
+        params = json.loads(payload["params"])
+
+        assert params.get("ids") and len(params["ids"]) == 1
+        return (
+            200,
+            {"Content-Type": "application/json"},
+            _querydiffs_response(params["ids"][0]),
+        )
+
     responses.add(
         responses.POST,
         "http://phabricator.test/api/user.whoami",
@@ -179,6 +212,12 @@ def mock_phabricator(mock_config):
         responses.POST,
         "http://phabricator.test/api/differential.diff.search",
         callback=diff_search,
+    )
+
+    responses.add_callback(
+        responses.POST,
+        "http://phabricator.test/api/differential.querydiffs",
+        callback=query_diffs,
     )
 
     responses.add(
@@ -267,6 +306,13 @@ def mock_phabricator(mock_config):
         content_type="application/json",
     )
 
+    responses.add(
+        responses.POST,
+        "http://phabricator.test/api/harbormaster.createartifact",
+        body=_response("harbormaster_createartifact"),
+        content_type="application/json",
+    )
+
     config_file = tempfile.NamedTemporaryFile()
     with open(config_file.name, "w") as f:
         custom_conf = ConfigParser()
@@ -283,11 +329,84 @@ def mock_phabricator(mock_config):
 
 
 @pytest.fixture
-def mock_try_task():
+def mock_github(mock_config):
     """
-    Mock a remote Try task definition
+    Mock default github API calls made by the client
     """
-    return {"extra": {"code-review": {"phabricator-diff": "PHID-HMBT-test"}}}
+    diff = dedent(
+        """diff --git a/path/to/test.cpp b/path/to/test.cpp
+        index c57eff55..980a0d5f 100644
+        --- a/path/to/test.cpp
+        +++ b/path/to/test.cpp
+        @@ -1 +1 @@
+        -#include <random>
+        +Hello World!
+        """
+    )
+
+    responses.add(
+        responses.GET,
+        "https://github.com/owner/repo-name/pull/1.diff",
+        json=diff,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.github.com:443/app/installations",
+        json=[
+            {
+                "id": 123456789,
+                "access_tokens_url": "https://github.com/app/installations/123456789/access_tokens",
+            }
+        ],
+    )
+    responses.add(
+        responses.POST,
+        "https://api.github.com:443/app/installations/123456789/access_tokens",
+        json={
+            "token": "auth_token",
+            "expires_at": (datetime.now(UTC) + timedelta(1)).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
+        },
+    )
+    responses.add(
+        responses.GET,
+        "https://api.github.com:443/repos/owner/repo-name",
+        json={"url": "https://api.github.com/repos/owner/repo-name"},
+    )
+    responses.add(
+        responses.GET,
+        "https://api.github.com:443/repos/owner/repo-name/pulls/1",
+        json={
+            "url": "https://api.github.com/repos/owner/repo-name/pulls/1",
+            "issue_url": "https://api.github.com/repos/owner/repo-name/pulls/1",
+            "user": {"login": "test_user"},
+        },
+    )
+    responses.add(
+        responses.GET,
+        "https://api.github.com:443/repos/owner/repo-name/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        json={"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    )
+
+
+@pytest.fixture
+def mock_github_decision_task():
+    """
+    Mock a decision task definition from a github revision
+    """
+    return {
+        "payload": {
+            "env": {
+                "GECKO_REPOSITORY_TYPE": "git",
+                "GECKO_HEAD_REPOSITORY": "https://github.com/owner/repo-name",
+                "GECKO_HEAD_REV": "a" * 40,
+                "GECKO_BASE_REPOSITORY": "https://github.com/owner/repo-name",
+                "GECKO_BASE_REV": "b" * 40,
+                "GECKO_PULL_REQUEST_NUMBER": 1,
+            }
+        }
+    }
 
 
 @pytest.fixture
@@ -328,14 +447,18 @@ def mock_autoland_task():
 
 
 @pytest.fixture
-def mock_revision(mock_phabricator, mock_try_task, mock_decision_task, mock_config):
+def mock_revision(mock_phabricator, mock_decision_task, mock_config):
     """
     Mock a mercurial revision
     """
-    from code_review_bot.revisions import PhabricatorRevision
+    from code_review_bot.revisions import PhabricatorRevision, Revision
 
     with mock_phabricator as api:
-        return PhabricatorRevision.from_try_task(mock_try_task, mock_decision_task, api)
+        revision = Revision.from_try_decision_task(
+            mock_decision_task, "PHID-HMBT-test", api
+        )
+        assert isinstance(revision, PhabricatorRevision)
+        return revision
 
 
 @pytest.fixture
@@ -347,6 +470,20 @@ def mock_revision_autoland(mock_phabricator, mock_autoland_task):
 
     with mock_phabricator as api:
         return PhabricatorRevision.from_decision_task(mock_autoland_task, api)
+
+
+@pytest.fixture
+def mock_github_revision(mock_github, mock_github_decision_task, mock_config):
+    """
+    Mock a github revision
+    """
+    from code_review_bot.revisions import GithubRevision, Revision
+
+    revision = Revision.from_try_decision_task(
+        mock_github_decision_task, "PHID-HMBT-test", None
+    )
+    assert isinstance(revision, GithubRevision)
+    return revision
 
 
 class Response:
@@ -363,8 +500,20 @@ class Response:
             return json.dumps(self.body)
 
     @property
+    def ok(self):
+        return self.code < 300
+
+    @property
+    def status_code(self):
+        return self.code
+
+    @property
     def content(self):
         return self.body.encode()
+
+    def iter_lines(self):
+        for line in self.body.splitlines():
+            yield line.encode()
 
     def json(self):
         return self.body
@@ -402,6 +551,10 @@ class MockQueue:
     def __init__(self):
         self._artifacts = {}
         self.session = SessionMock()
+        self.sealed_groups = []
+        self.cancelled_groups = []
+        self.cancelled_tasks = []
+        self.task_states = {}
 
     def configure(self, relations):
         # Reset the session mock
@@ -464,13 +617,16 @@ class MockQueue:
     def status(self, task_id):
         return self._status[task_id]
 
-    def listTaskGroup(self, group_id):
-        return {
-            "tasks": [
-                {"task": self.task(task_id), "status": self.status(task_id)["status"]}
-                for task_id in self._tasks.keys()
-            ]
-        }
+    def listTaskGroup(self, group_id, paginationHandler=None):
+        tasks = [
+            {"task": self.task(task_id), "status": self.status(task_id)["status"]}
+            for task_id in self._tasks.keys()
+        ]
+        if paginationHandler is None:
+            return {"tasks": tasks}
+
+        for task in tasks:
+            paginationHandler({"tasks": [task]})
 
     def listArtifacts(self, task_id, run_id):
         return self._artifacts.get(task_id, {})
@@ -478,9 +634,28 @@ class MockQueue:
     def listLatestArtifacts(self, task_id):
         return self._artifacts.get(task_id, {})
 
-    def buildUrl(self, route_name, task, run, name):
+    def buildUrl(self, route_name, *args):
+        if route_name == "getLatestArtifact":
+            task, name = args
+            return f"http://tc.test/{task}/artifacts/{name}"
+
         assert route_name == "getArtifact"
+        task, run, name = args
         return f"http://tc.test/{task}/{run}/artifacts/{name}"
+
+    def sealTaskGroup(self, group_id):
+        self.sealed_groups.append(group_id)
+        return {"taskGroupId": group_id, "sealed": "2026-01-01T00:00:00.000Z"}
+
+    def cancelTaskGroup(self, group_id):
+        assert group_id in self.sealed_groups, "Task group must be sealed first"
+        self.cancelled_groups.append(group_id)
+        return {"taskGroupId": group_id, "taskIds": []}
+
+    def cancelTask(self, task_id):
+        self.cancelled_tasks.append(task_id)
+        self.task_states[task_id] = "exception"
+        return {"status": self.status(task_id)["status"]}
 
     def createArtifact(self, task_id, run_id, name, payload):
         if task_id not in self._artifacts:
@@ -884,9 +1059,13 @@ class MockPhabricator:
         params = self.parse_request(request, ("constraints",))
 
         result = None
-        if params["constraints"]["slugs"] == ["taskgraph-reviewers"]:
+        if params["constraints"]["slugs"] == ["accessibility-frontend-reviewers"]:
             result = [
-                {"phid": "PHID-123456789-TGReviewers", "slug": "taskgraph-reviewers"}
+                {
+                    "phid": "PHID-123456789-A11yReviewers",
+                    "slug": "accessibility-frontend-reviewers",
+                    "attachments": {"members": {"members": []}},
+                }
             ]
 
         return (
@@ -1032,6 +1211,9 @@ def build_repository(tmpdir, name):
     repo.branch(name=b"default", force=True)
     repo.commit(message=b"Readme", user="test")
 
+    # Like a clone from a publishing remote, existing changesets are public
+    repo.phase(b".", public=True)
+
     # Mock push to avoid reaching try server
     repo.push = MagicMock(return_value=True)
     repo.rawcommand = MagicMock(wraps=repo.rawcommand)
@@ -1052,7 +1234,7 @@ def mock_mc(tmpdir):
         "try_url": "http://mozilla-central/try",
         "batch_size": 100,
     }
-    repo = Repository(config, tmpdir.realpath())
+    repo = MercurialRepository(config, tmpdir.realpath())
     repo._repo = build_repository(tmpdir, "mozilla-central")
     repo.clone = MagicMock(side_effect=lambda: True)
     return repo
@@ -1071,7 +1253,7 @@ def mock_nss(tmpdir):
         "try_url": "http://nss/try",
         "batch_size": 100,
     }
-    repo = Repository(config, tmpdir.realpath())
+    repo = MercurialRepository(config, tmpdir.realpath())
     repo._repo = build_repository(tmpdir, "nss")
     repo.clone = MagicMock(side_effect=lambda: True)
     return repo
@@ -1116,6 +1298,11 @@ def PhabricatorMock():
         params = _phab_params(request)
         assert "diffID" in params
         return (200, json_headers, _response("raw-{}".format(params["diffID"])))
+
+    def _query_diffs(request):
+        params = _phab_params(request)
+        assert params.get("ids") and len(params["ids"]) == 1
+        return (200, json_headers, _querydiffs_response(params["ids"][0]))
 
     def _edges(request):
         params = _phab_params(request)
@@ -1188,6 +1375,12 @@ def PhabricatorMock():
             responses.POST,
             "http://phabricator.test/api/differential.diff.search",
             callback=_diff_search,
+        )
+
+        resp.add_callback(
+            responses.POST,
+            "http://phabricator.test/api/differential.querydiffs",
+            callback=_query_diffs,
         )
 
         resp.add_callback(

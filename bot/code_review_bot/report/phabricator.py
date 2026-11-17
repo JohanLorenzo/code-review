@@ -9,11 +9,15 @@ from urllib.parse import urljoin
 import structlog
 from libmozdata.phabricator import BuildState, PhabricatorAPI
 
-from code_review_bot import Issue, Level, stats
+from code_review_bot import BaseIssue, IssueType, Level, stats
+from code_review_bot.analysis import AnalysisMode, get_issue_type
 from code_review_bot.backend import BackendAPI
 from code_review_bot.report.base import Reporter
+from code_review_bot.revisions import PhabricatorRevision
+from code_review_bot.tasks.a11y_frontend import handle_a11y_review_group
 from code_review_bot.tasks.clang_tidy_external import ExternalTidyIssue
 from code_review_bot.tasks.coverage import CoverageIssue
+from code_review_bot.testing_policy import apply_testing_policy_tag
 from code_review_bot.tools import treeherder
 
 BUG_REPORT_URL = "https://bugzilla.mozilla.org/enter_bug.cgi?product=Developer+Infrastructure&component=Source+Code+Analysis&short_desc=[Automated+review]+THIS+IS+A+PLACEHOLDER&comment=**Phabricator+URL:**+https://phabricator.services.mozilla.com/...&format=__default__"
@@ -60,6 +64,14 @@ The analysis task [{name}]({url}) failed, but we could not detect any defect.
 Please check this task manually.
 """
 
+COMMENT_ERROR_DETAILS = """
+Errors found in the log of [{name}]({log}):
+{details}"""
+
+COMMENT_OTHER_ERROR_DETAILS = """
+Errors for the {others} are available in their unit test results.
+"""
+
 FRONTEND_LINKS = """
 You can view these defects in the Diff Detail section of [Phabricator diff {diff_id}]({phabricator_diff_url}).
 """
@@ -67,7 +79,7 @@ You can view these defects in the Diff Detail section of [Phabricator diff {diff
 
 logger = structlog.get_logger(__name__)
 
-Issues = List[Issue]
+Issues = List[BaseIssue]
 
 
 class PhabricatorReporter(Reporter):
@@ -151,18 +163,34 @@ class PhabricatorReporter(Reporter):
             for issue in issues
             if issue.on_backend and issue.on_backend["hash"] in indexed_issues
         ]
+        unresolved_hashes = set(unresolved)
 
         # All previous issues that are not unresolved are closed
-        closed = [issue for issue in previous_issues if issue["hash"] not in unresolved]
+        closed = [
+            issue for issue in previous_issues if issue["hash"] not in unresolved_hashes
+        ]
 
         return unresolved, closed
 
-    def publish(self, issues, revision, task_failures, notices, reviewers):
+    def publish(
+        self, issues, revision, task_failures, notices, reviewers, analysis_mode
+    ):
         """
         Publish issues on Phabricator:
         * publishable issues use lint results
         * build errors are displayed as unit test results
         """
+        if not isinstance(revision, PhabricatorRevision):
+            logger.debug(
+                f"Skipping Phabricator publication ({revision.__class__.__name__})"
+            )
+            return
+
+        if not hasattr(self, "api"):
+            logger.warning(
+                "Phabricator API is not set: you need to configure credentials"
+            )
+            return
 
         # Add extra reviewers groups to the revision
         if reviewers:
@@ -190,11 +218,13 @@ class PhabricatorReporter(Reporter):
 
         # Use only new and publishable issues and patches
         # Avoid publishing a patch from a de-activated analyzer
+        issue_type = get_issue_type(analysis_mode)
         publishable_issues = [
             issue
             for issue in issues
             if issue.is_publishable()
             and issue.analyzer.name not in self.analyzers_skipped
+            and issue.type_ == issue_type
         ]
         patches = [
             patch
@@ -203,7 +233,7 @@ class PhabricatorReporter(Reporter):
         ]
 
         if publishable_issues:
-            # Publish detected patch's issues on Harbormaster, all at once, as lint issues
+            # Publish detected patch's issues on Harbormaster, all at once
             self.publish_harbormaster(revision, publishable_issues)
 
         # Retrieve all diffs for the current revision
@@ -220,35 +250,55 @@ class PhabricatorReporter(Reporter):
             diff["id"] for diff in rev_diffs if diff["id"] < revision.diff_id
         ]
         former_diff_id = sorted(older_diff_ids)[-1] if older_diff_ids else None
-        unresolved_issues, closed_issues = self.compare_issues(
-            former_diff_id, publishable_issues
-        )
 
-        if (
-            len(unresolved_issues) == len(publishable_issues)
-            and not closed_issues
-            and not task_failures
-            and not notices
-        ):
-            # Nothing changed, no issue have been opened or closed
-            logger.info(
-                "No new issues nor failures/notices were detected. "
-                "Skipping comment publication (some issues are unresolved)",
-                unresolved_count=len(unresolved_issues),
+        if analysis_mode == AnalysisMode.Lint:
+            # Handle the accessibility-frontend-reviewers group workflow.
+            handle_a11y_review_group(self.api, revision)
+
+            # Set the testing policy tag when it can be deduced from the modified files.
+            apply_testing_policy_tag(self.api, revision)
+
+            unresolved_issues, closed_issues = self.compare_issues(
+                former_diff_id, publishable_issues
             )
-            return publishable_issues, patches
 
-        # Publish comment summarizing detected, unresolved and closed issues
-        self.publish_summary(
-            revision,
-            publishable_issues,
-            patches,
-            task_failures,
-            notices,
-            former_diff_id=former_diff_id,
-            unresolved_count=len(unresolved_issues),
-            closed_count=len(closed_issues),
-        )
+            if (
+                len(unresolved_issues) == len(publishable_issues)
+                and not closed_issues
+                and not task_failures
+                and not notices
+            ):
+                # Nothing changed, no issue have been opened or closed
+                logger.info(
+                    "No new issues nor failures/notices were detected. "
+                    "Skipping comment publication (some issues are unresolved)",
+                    unresolved_count=len(unresolved_issues),
+                )
+                return publishable_issues, patches
+
+            # Publish comment summarizing detected, unresolved and closed issues
+            self.publish_summary(
+                revision,
+                publishable_issues,
+                patches,
+                task_failures,
+                notices,
+                former_diff_id=former_diff_id,
+                unresolved_count=len(unresolved_issues),
+                closed_count=len(closed_issues),
+            )
+        else:
+            if publishable_issues or task_failures:
+                self.publish_summary(
+                    revision,
+                    publishable_issues,
+                    [],
+                    task_failures,
+                    None,
+                    former_diff_id=None,
+                    unresolved_count=0,
+                    closed_count=0,
+                )
 
         # Publish statistics
         stats.add_metric("report.phabricator.issues", len(issues))
@@ -256,20 +306,21 @@ class PhabricatorReporter(Reporter):
 
         return publishable_issues, patches
 
-    def publish_harbormaster(
-        self, revision, lint_issues: Issues = [], unit_issues: Issues = []
-    ):
+    def publish_harbormaster(self, revision, issues: Issues = []):
         """
         Publish issues through HarborMaster
         either as lint results or unit tests results
         """
-        assert lint_issues or unit_issues, "No issues to publish"
+        assert issues, "No issues to publish"
+
+        lint_issues = [i for i in issues if i.type_ == IssueType.Lint]
+        unit_issues = [i for i in issues if i.type_ == IssueType.BuildTest]
 
         self.api.update_build_target(
             revision.build_target_phid,
             state=BuildState.Work,
-            lint=[issue.as_phabricator_lint() for issue in lint_issues],
-            unit=[issue.as_phabricator_unitresult() for issue in unit_issues],
+            lint=[issue.as_phabricator_issue() for issue in lint_issues],
+            unit=[issue.as_phabricator_issue() for issue in unit_issues],
         )
         logger.info(
             "Updated Harbormaster build state with issues",
@@ -348,9 +399,13 @@ class PhabricatorReporter(Reporter):
             if stat["nb_defects"] > 0:
                 defect_nb.append(self.pluralize("defect", stat["nb_defects"]))
 
+            analyzer_str = "[{name}]({log})".format(
+                name=stat["analyzer"], log=stat["log"]
+            )
+
             defects.append(
                 " - {nb} found by {analyzer}".format(
-                    analyzer=stat["analyzer"], nb=" and ".join(defect_nb)
+                    analyzer=analyzer_str, nb=" and ".join(defect_nb)
                 )
             )
         if defects:
@@ -402,6 +457,22 @@ class PhabricatorReporter(Reporter):
             lambda i: isinstance(i, ExternalTidyIssue), issues
         ):
             comment += tidy_external_issue.as_markdown_for_phab()
+
+        detailed_issues = sorted(
+            (issue for issue in issues if issue.as_error_details()),
+            key=lambda issue: issue.display_name,
+        )
+        if detailed_issues:
+            first = detailed_issues[0]
+            comment += COMMENT_ERROR_DETAILS.format(
+                name=first.display_name,
+                log=first.analyzer.log,
+                details=first.as_error_details(),
+            )
+            if (nb_others := len(detailed_issues) - 1) > 0:
+                comment += COMMENT_OTHER_ERROR_DETAILS.format(
+                    others=self.pluralize("other failed task", nb_others)
+                )
 
         for patch in patches:
             comment += COMMENT_DIFF_DOWNLOAD.format(

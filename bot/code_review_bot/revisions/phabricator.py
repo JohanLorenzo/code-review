@@ -2,17 +2,21 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+from __future__ import annotations
+
 import os
 import time
 import urllib.parse
 from pathlib import Path
 
 import requests
+import sentry_sdk
 import structlog
 from libmozdata.phabricator import PhabricatorAPI
 
 from code_review_bot import InvalidRepository, InvalidTrigger
 from code_review_bot.config import (
+    PHABRICATOR_POLL_DELAYS,
     REPO_AUTOLAND,
     REPO_MOZILLA_CENTRAL,
     GetAppUserAgent,
@@ -79,13 +83,16 @@ class PhabricatorRevision(Revision):
         # Patch analysis
         self.patch = patch
 
+    def persistent_id(self):
+        return self.phabricator_id
+
     @property
     def namespaces(self):
         # Simplify repository names
         def repo_slug(url):
             if url.startswith("https://hg.mozilla.org/"):
                 url = url[23:]
-            return url.replace("/", "-")
+            return url.replace("/", "_")
 
         out = []
 
@@ -130,19 +137,18 @@ class PhabricatorRevision(Revision):
         return f"Phabricator #{self.diff_id} - {self.diff_phid}"
 
     @staticmethod
-    def from_try_task(try_task: dict, decision_task: dict, phabricator: PhabricatorAPI):
+    def from_try_decision_task(
+        decision_task: dict, build_target_phid: str, phabricator: PhabricatorAPI
+    ):
         """
         Load identifiers from Phabricator, using the remote task description
         """
-        # Load build target phid from the task env
-        code_review = try_task["extra"]["code-review"]
-        build_target_phid = code_review.get("phabricator-diff") or code_review.get(
-            "phabricator-build-target"
-        )
         assert (
             build_target_phid is not None
         ), "Missing phabricator-build-target or phabricator-diff declaration"
-        assert build_target_phid.startswith("PHID-HMBT-")
+        assert build_target_phid.startswith(
+            "PHID-HMBT-"
+        ), f"Build target PHID {build_target_phid} is invalid as it does not start with PHID-HMBT- prefix"
 
         # And get the diff from the phabricator api
         buildable = phabricator.find_target_buildable(build_target_phid)
@@ -270,24 +276,44 @@ class PhabricatorRevision(Revision):
         )
 
     @staticmethod
-    def from_phabricator_trigger(build_target_phid: str, phabricator: PhabricatorAPI):
+    def from_phabricator_trigger(
+        build_target_phid: str, phabricator: PhabricatorAPI
+    ) -> PhabricatorRevision | None:
+        """
+        Build a revision from a Harbormaster build target.
+        Returns None when the revision is not public (the build cannot be loaded).
+        """
         assert build_target_phid.startswith("PHID-HMBT-")
 
         # This is the very first call on Phabricator API for that build, so we need to retry
         # a few times as the revision may not be immediately public
         buildable = None
-        for i in range(5):
+        tries = len(PHABRICATOR_POLL_DELAYS) + 1
+        for i, delay in enumerate((*PHABRICATOR_POLL_DELAYS, None)):
             try:
                 buildable = phabricator.find_target_buildable(build_target_phid)
                 break
             except Exception as e:
                 logger.info(
-                    f"Failed to load Harbormaster build on try {i+1}/5, will retry in 30 seconds",
+                    f"Failed to load Harbormaster build on try {i+1}/{tries}",
                     error=str(e),
                 )
-                time.sleep(30)
+                if delay is not None:
+                    time.sleep(delay)
         if buildable is None:
-            raise Exception("Failed to load Habormaster build, no more tries left")
+            logger.warning(
+                "Failed to load Harbormaster build, no more tries left. "
+                "The revision is probably not public, skipping it.",
+                build_target_phid=build_target_phid,
+            )
+            sentry_sdk.metrics.count(
+                "phabricator:harbormaster:no_access",
+                1,
+                attributes={
+                    "build_target_phid": build_target_phid,
+                },
+            )
+            return None
 
         diff_phid = buildable["fields"]["objectPHID"]
         assert diff_phid.startswith("PHID-DIFF-")
@@ -361,8 +387,17 @@ class PhabricatorRevision(Revision):
         )
         logger.info("Downloading HGMO file", url=url)
 
-        response = requests.get(url, headers=GetAppUserAgent())
-        response.raise_for_status()
+        try:
+            response = requests.get(url, headers=GetAppUserAgent())
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning("Failed to download file", path=path)
+                # Consider as empty content if the file is not found
+                return None
+            else:
+                # When encountering another HTTP error, raise the issue
+                raise e
 
         # Store in cache
         content = response.content.decode("utf-8")
@@ -430,3 +465,26 @@ class PhabricatorRevision(Revision):
             "head_changeset": self.head_changeset,
             "base_changeset": self.base_changeset,
         }
+
+    def serialize(self):
+        """
+        Outputs a tuple of dicts for revision and diff sent to backend
+        """
+        revision = {
+            "provider": "phabricator",
+            "provider_id": self.phabricator_id,
+            "title": self.title,
+            "bugzilla_id": self.bugzilla_id,
+            "base_repository": self.base_repository,
+            "head_repository": self.head_repository,
+            "base_changeset": self.base_changeset,
+            "head_changeset": self.head_changeset,
+        }
+        diff = {
+            "id": self.diff_id,
+            "provider_id": self.diff_phid,
+            "mercurial_hash": self.head_changeset,
+            "repository": self.head_repository,
+        }
+
+        return revision, diff

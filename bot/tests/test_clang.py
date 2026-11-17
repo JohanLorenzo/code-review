@@ -144,7 +144,7 @@ def test_as_markdown(mock_revision, mock_task):
 
 """
     )
-    assert issue.as_phabricator_lint() == {
+    assert issue.as_phabricator_issue() == {
         "char": 51,
         "code": "dummy-check",
         "line": 42,
@@ -160,7 +160,6 @@ def test_settings(mock_config):
     Extensions are hard-coded in settings are
     """
     assert mock_config.app_channel == "test"
-    assert mock_config.try_task_id == "remoteTryTask"
     assert mock_config.try_group_id == "remoteTryGroup"
     assert mock_config.cpp_extensions == frozenset(
         [".c", ".cpp", ".cc", ".cxx", ".m", ".mm"]

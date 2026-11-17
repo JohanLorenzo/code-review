@@ -1,20 +1,44 @@
+import enum
 from functools import cached_property
 
 import structlog
-from libmozdata.phabricator import BuildState, UnitResult, UnitResultState
+from libmozdata.phabricator import BuildState, ConduitError, UnitResult, UnitResultState
 
 from code_review_bot.sources.phabricator import PhabricatorBuild, PhabricatorBuildState
 
 logger = structlog.get_logger(__name__)
 
 
-LANDO_WARNING_MESSAGE = "Static analysis and linting are still in progress."
-LANDO_FAILURE_MESSAGE = (
-    "Static analysis and linting did not run due to a generic failure."
-)
+LANDO_WARNING_MESSAGE = "{test_mode_string} are still in progress."
+LANDO_FAILURE_MESSAGE = "{test_mode_string} did not run due to a generic failure."
 LANDO_FAILURE_HG_MESSAGE = (
-    "Static analysis and linting did not run due to failure in applying the patch."
+    "{test_mode_string} did not run due to failure in applying the patch."
 )
+
+
+class AnalysisMode(enum.Enum):
+    Lint = 1
+    BuildTest = 2
+
+
+def get_test_mode_string(analysis_mode: AnalysisMode):
+    if analysis_mode == AnalysisMode.Lint:
+        return "Static analysis and linting"
+    elif analysis_mode == AnalysisMode.BuildTest:
+        return "Builds and tests"
+    else:
+        raise NotImplementedError
+
+
+def get_issue_type(analysis_mode: AnalysisMode):
+    from code_review_bot import IssueType
+
+    if analysis_mode == AnalysisMode.Lint:
+        return IssueType.Lint
+    elif analysis_mode == AnalysisMode.BuildTest:
+        return IssueType.BuildTest
+    else:
+        raise NotImplementedError
 
 
 class PhabricatorRevisionBuild(PhabricatorBuild):
@@ -146,12 +170,21 @@ def publish_analysis_phabricator(payload, phabricator_api):
                 "Missing base revision on PhabricatorBuild, adding a warning to Unit Tests section on Phabricator"
             )
 
-        phabricator_api.create_harbormaster_uri(
-            build.target_phid,
-            "treeherder",
-            "CI (Treeherder) Jobs",
-            extras["treeherder_url"],
-        )
+        try:
+            phabricator_api.create_harbormaster_uri(
+                build.target_phid,
+                "treeherder",
+                "CI (Treeherder) Jobs",
+                extras["treeherder_url"],
+            )
+        except ConduitError as e:
+            if e.error_info and "Duplicate entry" in e.error_info:
+                logger.warning(
+                    "Harbormaster URI artifact already exists, skipping creation (retry?)",
+                    build=str(build),
+                )
+            else:
+                raise
 
     elif mode == "work":
         phabricator_api.update_build_target(build.target_phid, BuildState.Work)
@@ -161,13 +194,15 @@ def publish_analysis_phabricator(payload, phabricator_api):
         logger.warning("Unsupported publication", mode=mode, build=build)
 
 
-def publish_analysis_lando(payload, lando_warnings):
+def publish_analysis_lando(payload, lando_warnings, analysis_mode: AnalysisMode):
     """
     Publish result of patch application and push to try on Lando
     """
     mode, build, extras = payload
     assert isinstance(build, PhabricatorRevisionBuild), "Not a PhabricatorRevisionBuild"
     logger.debug("Publishing a Lando build update", mode=mode, build=str(build))
+
+    test_mode_string = get_test_mode_string(analysis_mode)
 
     if mode == "fail:general":
         # Send general failure message to Lando
@@ -178,7 +213,9 @@ def publish_analysis_lando(payload, lando_warnings):
         )
         try:
             lando_warnings.add_warning(
-                LANDO_FAILURE_MESSAGE, build.revision["id"], build.diff_id
+                LANDO_FAILURE_MESSAGE.format(test_mode_string=test_mode_string),
+                build.revision["id"],
+                build.diff_id,
             )
         except Exception as ex:
             logger.error(str(ex), exc_info=True)
@@ -192,7 +229,9 @@ def publish_analysis_lando(payload, lando_warnings):
         )
         try:
             lando_warnings.add_warning(
-                LANDO_FAILURE_HG_MESSAGE, build.revision["id"], build.diff_id
+                LANDO_FAILURE_HG_MESSAGE.format(test_mode_string=test_mode_string),
+                build.revision["id"],
+                build.diff_id,
             )
         except Exception as ex:
             logger.error(str(ex), exc_info=True)
@@ -205,7 +244,9 @@ def publish_analysis_lando(payload, lando_warnings):
         )
         try:
             lando_warnings.add_warning(
-                LANDO_WARNING_MESSAGE, build.revision["id"], build.diff_id
+                LANDO_WARNING_MESSAGE.format(test_mode_string=test_mode_string),
+                build.revision["id"],
+                build.diff_id,
             )
         except Exception as ex:
             logger.error(str(ex), exc_info=True)

@@ -1,7 +1,10 @@
-FROM python:3.13.7-slim
+FROM python:3.14.7-slim
 
 ADD tools /src/tools
 ADD backend /src/backend
+
+# System dependencies
+RUN apt-get update && apt-get install -q --yes netcat-openbsd
 
 # Setup tools
 RUN cd /src/tools && pip install --disable-pip-version-check --no-cache-dir --quiet .
@@ -16,4 +19,4 @@ RUN pip install --disable-pip-version-check --no-cache-dir --quiet .
 # Collect all static files
 RUN ./manage.py collectstatic --no-input
 
-CMD gunicorn code_review_backend.app.wsgi
+ENTRYPOINT ["/src/backend/docker/entrypoint.sh"]

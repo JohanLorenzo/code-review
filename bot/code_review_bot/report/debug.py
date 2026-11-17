@@ -23,19 +23,21 @@ class DebugReporter(Reporter):
         assert os.path.isdir(output_dir), "Invalid output dir"
         self.report_path = os.path.join(output_dir, "report.json")
 
-    def publish(self, issues, revision, task_failures, links, reviewers):
+    def publish(self, issues, revision, task_failures, links, reviewers, analysis_mode):
         """
         Display issues choices
         """
         # Simply output issues details through logging
         logger.info("Debug revision", rev=str(revision))
+        # Only log publishable issues one by one, as there can be thousands of
+        # silent issues: they are all available in the JSON report anyway
+        nb_silent = 0
         for issue in issues:
-            logger.info(
-                "Issue {}".format(
-                    "publishable" if issue.is_publishable() else "silent"
-                ),
-                issue=str(issue),
-            )
+            if issue.is_publishable():
+                logger.info("Issue publishable", issue=str(issue))
+            else:
+                nb_silent += 1
+        logger.info("Silent issues", nb=nb_silent)
         for task in task_failures:
             logger.info("Task failure detected", name=task.name, task=task.id)
         for patch in revision.improvement_patches:

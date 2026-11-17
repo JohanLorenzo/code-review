@@ -4,7 +4,40 @@
 
 import itertools
 
-from code_review_bot import Level
+from code_review_bot import IssueType, Level
+
+OMITTED_ERROR_DETAILS = (
+    "Error details for {count} failed task{plural} were omitted to keep this "
+    "message under its size limit; see the linked logs."
+)
+
+
+def format_build_errors(issues, limit, collapsible=False):
+    links = [issue.as_error() for issue in issues]
+    omitted_note = OMITTED_ERROR_DETAILS.format(count=len(issues), plural="s")
+    budget = limit - len("\n".join(links)) - len(omitted_note) - 1
+
+    messages = []
+    omitted = 0
+    for issue, link in zip(issues, links):
+        messages.append(link)
+        details = issue.as_error_details(collapsible)
+        if not details:
+            continue
+        if len(details) + 1 <= budget:
+            messages.append(details)
+            budget -= len(details) + 1
+        else:
+            omitted += 1
+
+    if omitted:
+        messages.append(
+            OMITTED_ERROR_DETAILS.format(
+                count=omitted, plural="s" if omitted > 1 else ""
+            )
+        )
+
+    return "\n".join(messages)
 
 
 class Reporter:
@@ -52,13 +85,20 @@ class Reporter:
 
         def stats(analyzer, items):
             _items = list(items)
-            paths = list({i.path for i in _items if i.is_publishable()})
+            paths = list(
+                {
+                    i.path
+                    for i in _items
+                    if i.is_publishable() and i.type_ == IssueType.Lint
+                }
+            )
 
             publishable = sum(i.is_publishable() for i in _items)
             build_errors = sum(i.is_build_error() for i in _items)
 
             return {
                 "analyzer": analyzer.display_name,
+                "log": analyzer.log,
                 "help": analyzer.build_help_message(paths),
                 "total": len(_items),
                 "publishable": publishable,

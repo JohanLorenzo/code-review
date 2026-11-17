@@ -13,7 +13,7 @@ repos:
       - id: prettier
         exclude: fixtures|mocks
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: v6.0.0
     hooks:
       - id: check-ast
       - id: check-docstring-first
@@ -33,17 +33,22 @@ repos:
     rev: v2.2.4
     hooks:
       - id: codespell
-        exclude_types: [json]
+        exclude_types: [json, pem]
   - repo: https://github.com/marco-c/taskcluster_yml_validator
-    rev: v0.0.11
+    rev: v0.0.13
     hooks:
       - id: taskcluster_yml
   - repo: https://github.com/asottile/yesqa
-    rev: v1.4.0
+    rev: v1.5.0
     hooks:
       - id: yesqa
   - repo: meta
     hooks:
       - id: check-useless-excludes
+  - repo: https://github.com/adamchainz/django-upgrade
+    rev: 1.32.0
+    hooks:
+      - id: django-upgrade
+
 default_language_version:
   python: python3

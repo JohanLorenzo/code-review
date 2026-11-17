@@ -16,6 +16,7 @@ from libmozdata.phabricator import (
     UnitResult,
     UnitResultState,
 )
+from taskcluster.download import downloadArtifactToBuf
 
 from code_review_bot import (
     AnalysisException,
@@ -24,6 +25,7 @@ from code_review_bot import (
     stats,
     taskcluster,
 )
+from code_review_bot.analysis import AnalysisMode, get_test_mode_string
 from code_review_bot.config import settings
 from code_review_bot.report import get_reporters
 from code_review_bot.revisions import PhabricatorRevision, Revision
@@ -34,9 +36,7 @@ from code_review_bot.workflow import Workflow
 logger = structlog.get_logger(__name__)
 
 
-LANDO_FAILURE_MESSAGE = (
-    "Static analysis and linting did not run due to a generic failure."
-)
+LANDO_FAILURE_MESSAGE = "{test_mode_string} did not run due to a generic failure."
 
 
 def parse_cli():
@@ -61,6 +61,13 @@ def parse_cli():
         "Reduce the time required to read updated files, i.e. to compute the unique hash of multiple issues.\n"
         "A clone is automatically performed when ingesting a revision and this option is unset, "
         "except on a developer instance (where HGMO is used).",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--github-repository",
+        help="Optional path to a up-to-date github repository matching the analyzed revision.\n"
+        "This argument is required for Github revisions in order to compute issues' hashes based on file content.",
         type=Path,
         default=None,
     )
@@ -109,6 +116,10 @@ def main():
     # Setup libmozdata configuration
     setup_libmozdata("code-review-bot")
 
+    os.environ["PHABRICATOR_EDGE_KEY"] = taskcluster.secrets.get(
+        "PHABRICATOR_EDGE_KEY", ""
+    )
+
     # Setup settings before stats
     settings.setup(
         taskcluster.secrets["APP_CHANNEL"],
@@ -116,6 +127,11 @@ def main():
         taskcluster.secrets["repositories"],
         taskcluster.secrets["ssh_key"],
         args.mercurial_repository,
+        args.github_repository,
+        backend_parallel_requests=taskcluster.secrets.get("BACKEND_PARALLEL_REQUESTS"),
+        taskcluster_parallel_requests=taskcluster.secrets.get(
+            "TASKCLUSTER_PARALLEL_REQUESTS"
+        ),
     )
 
     # Setup statistics
@@ -159,6 +175,19 @@ def main():
     # We need Phabricator API to list black-listed users
     settings.load_user_blacklist(taskcluster.secrets["user_blacklist"], phabricator_api)
 
+    # Run workflow according to source
+    w = Workflow(
+        reporters,
+        index_service,
+        queue_service,
+        phabricator_api,
+        taskcluster.secrets["ZERO_COVERAGE_ENABLED"],
+        # Update build status only when phabricator reporting is enabled
+        update_build=phabricator_reporting_enabled,
+        task_failures_ignored=taskcluster.secrets["task_failures_ignored"],
+    )
+
+    revision = None
     # Load unique revision
     try:
         if settings.generic_group_id:
@@ -166,18 +195,39 @@ def main():
             revision = PhabricatorRevision.from_decision_task(
                 queue_service.task(settings.generic_group_id), phabricator_api
             )
+            w.ingest_revision(revision, settings.generic_group_id)
         elif settings.phabricator_build_target:
             # Only Phabricator revisions is supported from build target
             revision = PhabricatorRevision.from_phabricator_trigger(
                 settings.phabricator_build_target,
                 phabricator_api,
             )
+            if revision is None:
+                return 0
+
+            if settings.analysis_mode == AnalysisMode.BuildTest:
+                # Allow for this feature to be turned on gradually
+                if not revision.build_test_feature:
+                    # Make sure we don't leave a hanging Build on Phabricator!
+                    w.update_status(revision, state=BuildState.Pass)
+                    return 0
+
+            w.start_analysis(revision, settings.analysis_mode)
         else:
-            revision = Revision.from_try_task(
-                queue_service.task(settings.try_task_id),
-                queue_service.task(settings.try_group_id),
+            decision_task = queue_service.task(settings.try_group_id)
+            rawParams, _ = downloadArtifactToBuf(
+                taskId=settings.try_group_id,
+                name="public/parameters.yml",
+                queueService=queue_service,
+            )
+            parameters = yaml.safe_load(bytes(rawParams))
+            revision = Revision.from_try_decision_task(
+                decision_task,
+                parameters["phabricator_diff"],
                 phabricator_api,
             )
+
+            w.run(revision, settings.analysis_mode)
 
     except InvalidTrigger as e:
         logger.info("Early stop analysis due to invalid trigger", error=str(e))
@@ -190,40 +240,22 @@ def main():
         # Stop cleanly as we just want to ignore that case, but report on sentry through warning
         return 0
     except Exception as e:
-        # Report revision loading failure on production only
-        # On testing or dev instances, we can use different Phabricator
-        # configuration that do not match all the pulse messages sent
-        if settings.on_production:
-            raise
+        if not revision:
+            # Report revision loading failure on production only
+            # On testing or dev instances, we can use different Phabricator
+            # configuration that do not match all the pulse messages sent
+            if settings.on_production:
+                raise
 
-        else:
-            logger.info(
-                "Failed to load revision",
-                task=settings.try_task_id,
-                error=str(e),
-                phabricator=phabricator["url"],
-            )
-            return 1
+            else:
+                logger.info(
+                    "Failed to load revision",
+                    task=settings.try_group_id,
+                    error=str(e),
+                    phabricator=phabricator["url"],
+                )
+                return 1
 
-    # Run workflow according to source
-    w = Workflow(
-        reporters,
-        index_service,
-        queue_service,
-        phabricator_api,
-        taskcluster.secrets["ZERO_COVERAGE_ENABLED"],
-        # Update build status only when phabricator reporting is enabled
-        update_build=phabricator_reporting_enabled,
-        task_failures_ignored=taskcluster.secrets["task_failures_ignored"],
-    )
-    try:
-        if settings.generic_group_id:
-            w.ingest_revision(revision, settings.generic_group_id)
-        elif settings.phabricator_build_target:
-            w.start_analysis(revision)
-        else:
-            w.run(revision)
-    except Exception as e:
         # Log errors to papertrail
         logger.error(
             "Static analysis failure", revision=revision, error=e, exc_info=True
@@ -234,7 +266,14 @@ def main():
         if isinstance(e, AnalysisException):
             extras["error_code"] = e.code
             extras["error_message"] = str(e)
-        w.index(revision, state="error", **extras)
+
+        namespace_suffixes = ["", "lint"]
+        if settings.analysis_mode == AnalysisMode.BuildTest:
+            namespace_suffixes = ["build-test"]
+
+        w.index(
+            revision, namespace_suffixes=namespace_suffixes, state="error", **extras
+        )
 
         # Update Phabricator
         failure = UnitResult(
@@ -246,7 +285,7 @@ def main():
             duration=0,
         )
 
-        if phabricator_reporting_enabled:
+        if phabricator_reporting_enabled and isinstance(revision, PhabricatorRevision):
             w.phabricator.update_build_target(
                 revision.build_target_phid, BuildState.Fail, unit=[failure]
             )
@@ -258,10 +297,22 @@ def main():
             )
         elif lando_publish_generic_failure:
             try:
-                lando_api.del_all_warnings(revision.id, revision.diff["id"])
-                lando_api.add_warning(
-                    LANDO_FAILURE_MESSAGE, revision.id, revision.diff["id"]
-                )
+                if settings.analysis_mode:
+                    test_mode_string = get_test_mode_string(settings.analysis_mode)
+                    warnings = lando_api.get_warnings(revision.id, revision.diff["id"])
+                    to_delete = [
+                        w
+                        for w in warnings
+                        if w["data"]["message"].startswith(test_mode_string)
+                    ]
+                    if to_delete:
+                        lando_api.del_warnings(to_delete)
+
+                    lando_api.add_warning(
+                        LANDO_FAILURE_MESSAGE.format(test_mode_string=test_mode_string),
+                        revision.id,
+                        revision.diff["id"],
+                    )
             except Exception as ex:
                 logger.error(str(ex), exc_info=True)
 

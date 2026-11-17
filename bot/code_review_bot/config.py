@@ -6,16 +6,22 @@
 import atexit
 import collections
 import fnmatch
+import importlib.metadata
 import os
 import shutil
 import tempfile
 from pathlib import Path
 
-import pkg_resources
 import structlog
+
+from code_review_bot.analysis import AnalysisMode
 
 REPO_MOZILLA_CENTRAL = "https://hg.mozilla.org/mozilla-central"
 REPO_AUTOLAND = "https://hg.mozilla.org/integration/autoland"
+
+# Delays (in seconds) between checks while waiting for a Phabricator build to be available.
+# Short at first as builds usually become available quickly, for a total of ~2.5 minutes.
+PHABRICATOR_POLL_DELAYS = (2, 3, 5, 10, 15, 25, 30, 30, 30)
 
 logger = structlog.get_logger(__name__)
 
@@ -43,21 +49,33 @@ class Settings:
         }
         self.app_channel = None
         self.taskcluster = None
-        self.try_task_id = None
         self.try_group_id = None
         self.generic_group_id = None
         self.phabricator_build_target = None
+        self.analysis_mode = None
         self.repositories = []
         self.decision_env_prefixes = []
 
         # Max number of issues published to the backend at a time during the ingestion of a revision
         self.bulk_issue_chunks = 100
 
+        # Number of concurrent requests made to the code review backend
+        self.backend_parallel_requests = 8
+
+        # Number of concurrent requests made to Taskcluster
+        self.taskcluster_parallel_requests = 8
+
         # Cache to store file-by-file from HGMO Rest API
         self.hgmo_cache = tempfile.mkdtemp(suffix="hgmo")
 
+        # Files extracted from the local mercurial repository
+        self.mercurial_files = tempfile.mkdtemp(suffix="mercurial-files")
+
         # Cache to store whole repositories
         self.mercurial_cache = None
+        self.git_cache = None
+        # Repository URLs for which the fallback checkout path has been logged
+        self.mercurial_cache_fallback_logged = set()
 
         # SSH Key used to push on try
         self.ssh_key = None
@@ -69,7 +87,7 @@ class Settings:
         # Always cleanup at the end of the execution
         atexit.register(self.cleanup)
         # caching the versions of the app
-        self.version = pkg_resources.require("code-review-bot")[0].version
+        self.version = importlib.metadata.version("code-review-bot")
 
     def setup(
         self,
@@ -78,19 +96,40 @@ class Settings:
         repositories,
         ssh_key=None,
         mercurial_cache=None,
+        git_cache=None,
+        backend_parallel_requests=None,
+        taskcluster_parallel_requests=None,
     ):
         # Detect source from env
-        if "TRY_TASK_ID" in os.environ and "TRY_TASK_GROUP_ID" in os.environ:
-            self.try_task_id = os.environ["TRY_TASK_ID"]
+        # publication mode for builds & tests (we're looking at an entire
+        # task group)
+        if "TRY_TASK_GROUP_ID" in os.environ:
             self.try_group_id = os.environ["TRY_TASK_GROUP_ID"]
+            mode = os.environ.get("ANALYSIS_MODE")
+            if mode is None:
+                raise Exception("ANALYSIS_MODE must be set in the env!")
+            try:
+                self.analysis_mode = AnalysisMode[mode]
+            except KeyError:
+                raise Exception(f"Invalid ANALYSIS_MODE: {mode}")
+        # ingestion mode for production branches
         elif "GENERIC_TASK_GROUP_ID" in os.environ:
             self.generic_group_id = os.environ["GENERIC_TASK_GROUP_ID"]
+        # analysis mode; we're kicking off a new run from a phabricator diff
+        # update
         elif "PHABRICATOR_BUILD_TARGET" in os.environ:
             # Setup trigger mode using Phabricator information
             self.phabricator_build_target = os.environ["PHABRICATOR_BUILD_TARGET"]
             assert self.phabricator_build_target.startswith(
                 "PHID-HMBT"
             ), f"Not a phabrication build target PHID: {self.phabricator_build_target}"
+            mode = os.environ.get("ANALYSIS_MODE")
+            if mode is None:
+                raise Exception("ANALYSIS_MODE must be set in the env!")
+            try:
+                self.analysis_mode = AnalysisMode[mode]
+            except KeyError:
+                raise Exception(f"Invalid ANALYSIS_MODE: {mode}")
         else:
             raise Exception("Only TRY mode is supported")
 
@@ -105,11 +144,20 @@ class Settings:
             self.taskcluster = TaskCluster(
                 tempfile.mkdtemp(), "local instance", 0, True
             )
+
         if not os.path.isdir(self.taskcluster.results_dir):
             os.makedirs(self.taskcluster.results_dir)
 
         if "BULK_ISSUE_CHUNKS" in os.environ:
             self.bulk_issue_chunks = int(os.environ["BULK_ISSUE_CHUNKS"])
+
+        if backend_parallel_requests is not None:
+            self.backend_parallel_requests = int(backend_parallel_requests)
+            assert self.backend_parallel_requests > 0, "Invalid parallel requests"
+
+        if taskcluster_parallel_requests is not None:
+            self.taskcluster_parallel_requests = int(taskcluster_parallel_requests)
+            assert self.taskcluster_parallel_requests > 0, "Invalid parallel requests"
 
         # Save allowed paths
         assert isinstance(allowed_paths, list)
@@ -148,6 +196,17 @@ class Settings:
             # Save ssh key when mercurial cache is enabled
             self.ssh_key = ssh_key
 
+        # Store github cache path
+        if git_cache is not None:
+            self.git_cache = Path(git_cache)
+            assert (
+                self.git_cache.exists()
+            ), f"Github cache does not exist {self.git_cache}"
+            logger.info("Using Github cache", path=self.mercurial_cache)
+        else:
+            # Fallback to mercurial cache to ease migration on production systems
+            self.git_cache = self.mercurial_cache
+
     def load_user_blacklist(self, usernames, phabricator_api):
         """
         Load all black listed users from Phabricator API
@@ -172,14 +231,41 @@ class Settings:
         """
         return self.app_channel == "production" and self.taskcluster.local is False
 
-    @property
-    def mercurial_cache_checkout(self):
+    def mercurial_cache_checkout(self, repository_url: str | None) -> Path | None:
         """
-        When local mercurial cache is enabled, path to the checkout
+        When local mercurial cache is enabled, path to the checkout of a repository.
+        Configured repositories use the same directory as the analysis task
+        (named after the repository), so the working copy is shared between
+        analysis and publication tasks running on the same worker.
         """
         if self.mercurial_cache is None:
             return
+
+        if repository_url:
+            for repository in self.repositories:
+                if repository.url.rstrip("/") == repository_url.rstrip("/"):
+                    return self.mercurial_cache / repository.name
+
+        # Log only once per URL, as this is called for every issue
+        if repository_url not in self.mercurial_cache_fallback_logged:
+            self.mercurial_cache_fallback_logged.add(repository_url)
+            logger.warning(
+                "Repository is not configured, not sharing its checkout with the analysis task",
+                url=repository_url,
+            )
+
         return self.mercurial_cache / "checkout"
+
+    @property
+    def mercurial_cache_files(self):
+        """
+        When local mercurial cache is enabled, path to the files extracted from the
+        repository (only those needed to build the issues hashes)
+        This is a temporary directory, as the cache is persisted across tasks
+        """
+        if self.mercurial_cache is None:
+            return
+        return Path(self.mercurial_files)
 
     @property
     def mercurial_cache_sharebase(self):
@@ -198,6 +284,7 @@ class Settings:
 
     def cleanup(self):
         shutil.rmtree(self.hgmo_cache)
+        shutil.rmtree(self.mercurial_files)
 
     @property
     def taskcluster_url(self):

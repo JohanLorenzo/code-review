@@ -35,14 +35,11 @@ The following configuration variables are currently supported:
 - `REPORTERS` **[required]** lists all the reporting tools to use when a code review is completed (details below)
 - `PHABRICATOR` **[required]** holds the credentials to make API calls on Phabricator.
 - `ZERO_COVERAGE_ENABLED` is a boolean value enabling or disabling the zero coverage warning report.
+- `BACKEND_PARALLEL_REQUESTS` is the optional number of concurrent requests made to the code review backend (defaults to 8).
+- `TASKCLUSTER_PARALLEL_REQUESTS` is the optional number of concurrent requests made to Taskcluster, e.g. to load tasks artifacts (defaults to 8).
 - `PAPERTRAIL_HOST` is the optional Papertrail host configuration, used for logging.
 - `PAPERTRAIL_PORT` is the optional Papertrail port configuration, used for logging.
 - `SENTRY_DSN` is the optional Sentry full url to report runtime errors.
-
-The `REPORTERS` configuration is a list of dictionaries describing which reporting tool to use at the end of the patches code review.
-Supported reporting tools are emails (for admins) and Phabricator.
-
-Each reporter configuration must contain a `reporter` key with a unique name per tool. Each tool has its own configuration requirement.
 
 You can view a [full configuration sample here](/docs/configuration.md).
 
@@ -56,7 +53,19 @@ They are required, and must be set like this:
     api_key: api-XXXX
 ```
 
-## Reporter: Mail
+## Reporters
+
+The `REPORTERS` configuration is a list of dictionaries describing which reporting tool to use at the end of the code review analysis.
+Supported reporting tools are:
+
+- Emails (only for admins)
+- Phabricator (only for revisions coming from Phabricator)
+- Lando (updates lando with a warning message, only for revisions coming from Phabricator)
+- Build errors (warns about build errors, by email for Phabricator and as a comment in Github)
+
+Each reporter configuration must contain a `reporter` key with a unique name per tool. If a reporter cannot handle the revision source, it will be skipped. Each tool has its own configuration requirement.
+
+### Reporter: Mail
 
 Key `reporter` is `mail`
 
@@ -66,7 +75,7 @@ Only one configuration is required: `emails` is a list of emails addresses recei
 
 This reporter will send detailed information about every issue.
 
-## Reporter: Phabricator
+### Reporter: Phabricator
 
 Key `reporter` is `phabricator`
 
@@ -75,6 +84,23 @@ Configuration:
 - `analyzers_skipped` : The analyzers that will **not** be published on Phabricator.
 
 This reporter will send detailed information about every **publishable** issue.
+
+It also sets the [testing policy](https://firefox-source-docs.mozilla.org/testing/testing-policy/index.html) tag on the revision when it can be deduced.
+
+### Reporter: Github
+
+Key `reporter` is `github`
+
+Configuration:
+
+- `client_id` : Github App client ID.
+- `private_key_pem` : Content of the github App private key.
+- `installation_id` : ID of the Github App [installation](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app) (integer).
+- `analyzers_skipped` : The analyzers that will **not** be published on Phabricator.
+
+This reporter will send detailed information about every **publishable** issue in a review.
+
+In case no issue is found, the reported will approve the Pull Request.
 
 ## Example configuration
 
@@ -89,4 +115,12 @@ common:
 bot:
   REPORTERS:
     - reporter: phabricator
+    - reporter: github
+      client_id: xxxxxxxxxxxxxxxxxxxx
+      private_key_pem: |-
+        -----BEGIN RSA PRIVATE KEY-----
+        XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+        XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+        -----END RSA PRIVATE KEY-----
+      installation_id: 123456789
 ```

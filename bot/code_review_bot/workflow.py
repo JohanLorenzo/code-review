@@ -2,30 +2,42 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-import time
+import base64
+import json
+import re
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from itertools import groupby
 
 import structlog
-from libmozdata.phabricator import BuildState, PhabricatorAPI
+from libmozdata.phabricator import BuildState, ConduitError, PhabricatorAPI
 from taskcluster.utils import stringDate
 
 from code_review_bot import Level, stats
 from code_review_bot.analysis import (
+    AnalysisMode,
     PhabricatorRevisionBuild,
+    get_issue_type,
     publish_analysis_lando,
     publish_analysis_phabricator,
 )
 from code_review_bot.backend import BackendAPI
 from code_review_bot.config import settings
-from code_review_bot.mercurial import MercurialWorker, Repository, robust_checkout
+from code_review_bot.git import git_clone
+from code_review_bot.mercurial import (
+    MercurialRepository,
+    MercurialWorker,
+    cat_files,
+    robust_checkout,
+)
 from code_review_bot.report.debug import DebugReporter
-from code_review_bot.revisions import PhabricatorRevision, Revision
+from code_review_bot.revisions import GithubRevision, PhabricatorRevision, Revision
 from code_review_bot.sources.phabricator import (
     PhabricatorActions,
     PhabricatorBuildState,
 )
 from code_review_bot.tasks.base import AnalysisTask, BaseTask, NoticeTask
+from code_review_bot.tasks.build import BuildTask
 from code_review_bot.tasks.clang_format import ClangFormatTask
 from code_review_bot.tasks.clang_tidy import ClangTidyTask
 from code_review_bot.tasks.clang_tidy_external import ExternalTidyTask
@@ -39,6 +51,13 @@ logger = structlog.get_logger(__name__)
 
 TASKCLUSTER_NAMESPACE = "project.relman.{channel}.code-review.{name}"
 TASKCLUSTER_INDEX_TTL = 7  # in days
+
+DECISION_TASK_ROUTE = "gecko.v2.{repo}.revision.{revision}.taskgraph.decision"
+PUBLICATION_LOG_ARTIFACT = "public/logs/live_backing.log"
+TREEHERDER_LINK_REGEX = re.compile(
+    rb"treeherder\.mozilla\.org/(?:#/)?jobs\?repo=(?P<repo>[\w-]+)"
+    rb"&revision=(?P<revision>[0-9a-f]{12,40})"
+)
 
 
 class Workflow:
@@ -88,16 +107,22 @@ class Workflow:
         # Is local clone already setup ?
         self.clone_available = False
 
-    def run(self, revision):
+    def run(self, revision, analysis_mode: AnalysisMode):
         """
         Find all issues on remote tasks and publish them
         """
+        if analysis_mode == AnalysisMode.Lint:
+            return self._run_lint(revision)
+        elif analysis_mode == AnalysisMode.BuildTest:
+            return self._run_build_test(revision)
+
+    def _run_lint(self, revision):
         # Index ASAP Taskcluster task for this revision
-        self.index(revision, state="started")
+        self.index(revision, state="started", namespace_suffixes=["", "lint"])
 
         # Set the Phabricator build as running
         self.update_status(revision, state=BuildState.Work)
-        if settings.taskcluster_url:
+        if settings.taskcluster_url and isinstance(revision, PhabricatorRevision):
             self.publish_link(
                 revision,
                 slug="publication",
@@ -130,19 +155,20 @@ class Workflow:
 
             # Clone local repo when required
             # as find_previous_issues will build the hashes
-            self.clone_repository(revision)
+            if issues:
+                self.clone_repository(revision, issues)
 
             # Mark know issues to avoid publishing them on this patch
-            self.find_previous_issues(issues, base_rev_changeset)
+            self.find_previous_issues(revision, issues, base_rev_changeset)
             new_issues_count = sum(issue.new_issue for issue in issues)
             logger.info(
                 f"Found {new_issues_count} new issues (over {len(issues)} total detected issues)",
                 task=settings.try_group_id,
             )
-        else:
+        elif issues:
             # Clone local repo when required
             # as publication need the hashes
-            self.clone_repository(revision)
+            self.clone_repository(revision, issues)
 
         if (
             all(issue.new_issue is False for issue in issues)
@@ -152,7 +178,50 @@ class Workflow:
             logger.info("No issues nor notices, stopping there.")
 
         # Publish all issues
-        self.publish(revision, issues, task_failures, notices, reviewers)
+        self.publish(
+            revision,
+            issues,
+            task_failures,
+            notices,
+            reviewers,
+            AnalysisMode.Lint,
+            ["", "lint"],
+        )
+
+        return issues
+
+    def _run_build_test(self, revision):
+        """
+        Find build and test failures and publish them
+        """
+        # Index ASAP Taskcluster task for this revision
+        self.index(revision, namespace_suffixes=["build-test"], state="started")
+
+        # Set the Phabricator build as running
+        self.update_status(revision, state=BuildState.Work)
+        if settings.taskcluster_url and isinstance(revision, PhabricatorRevision):
+            self.publish_link(
+                revision,
+                slug="publication",
+                name="Publication task",
+                url=settings.taskcluster_url,
+            )
+
+        issues, task_failures, notices, reviewers = self.find_build_test_issues(
+            revision, settings.try_group_id
+        )
+
+        # Publish all issues
+        self.publish(
+            revision,
+            issues,
+            task_failures,
+            notices,
+            reviewers,
+            AnalysisMode.BuildTest,
+            ["build-test"],
+            publish_to_backend=False,
+        )
 
         return issues
 
@@ -220,10 +289,20 @@ class Workflow:
             nb=len(supported_tasks),
         )
 
-        # Load all the artifacts and potential issues
+        # Load all the artifacts in parallel, as each task download is independent
+        with ThreadPoolExecutor(
+            max_workers=settings.taskcluster_parallel_requests
+        ) as executor:
+            tasks_artifacts = list(
+                executor.map(
+                    lambda task: task.load_artifacts(self.queue_service),
+                    supported_tasks,
+                )
+            )
+
+        # Then parse potential issues from the main thread
         issues = []
-        for task in supported_tasks:
-            artifacts = task.load_artifacts(self.queue_service)
+        for task, artifacts in zip(supported_tasks, tasks_artifacts):
             if artifacts is not None:
                 task_issues = task.parse_issues(artifacts, revision)
                 logger.info(
@@ -242,32 +321,36 @@ class Workflow:
             return
 
         # Clone local repo when required
-        self.clone_repository(revision)
+        self.clone_repository(revision, issues)
 
         # Publish issues in the backend
         self.backend_api.publish_issues(issues, revision)
 
-    def start_analysis(self, revision):
+    def start_analysis(
+        self, revision: PhabricatorRevision, analysis_mode: AnalysisMode
+    ):
         """
         Apply a patch on a local clone and push to try to trigger a new Code review analysis
         """
         logger.info("Starting revision analysis", revision=revision)
-        if not isinstance(revision, PhabricatorRevision):
-            raise NotImplementedError(
-                "Only Phabricator revisions are supported for now"
-            )
+
+        namespace_suffixes = ["", "lint"]
+        if analysis_mode == AnalysisMode.BuildTest:
+            namespace_suffixes = ["build-test"]
 
         # Index ASAP Taskcluster task for this revision
-        self.index(revision, state="analysis")
+        self.index(revision, state="analysis", namespace_suffixes=namespace_suffixes)
 
         # Do not process revisions from black-listed users
         if revision.is_blacklisted:
             logger.warning("Blacklisted author, stopping there.")
             return
 
-        # Cannot run without mercurial cache configured
-        if not settings.mercurial_cache:
-            raise Exception("Mercurial cache must be configured to start analysis")
+        # Cannot run without either mercurial or github cache configured
+        if not settings.mercurial_cache and not settings.git_cache:
+            raise Exception(
+                "One of Mercurial cache or github cache must be configured to start analysis"
+            )
 
         # Cannot run without ssh key
         if not settings.ssh_key:
@@ -275,7 +358,7 @@ class Workflow:
 
         # Set the Phabricator build as running
         self.update_status(revision, state=BuildState.Work)
-        if settings.taskcluster_url:
+        if settings.taskcluster_url and isinstance(revision, PhabricatorRevision):
             self.publish_link(
                 revision,
                 slug="analysis",
@@ -293,7 +376,7 @@ class Workflow:
         )
 
         # Initialize mercurial repository
-        repository = Repository(
+        repository = MercurialRepository(
             config={
                 "name": revision.base_repository_conf.name,
                 "try_name": revision.base_repository_conf.try_name,
@@ -308,26 +391,18 @@ class Workflow:
             cache_root=settings.mercurial_cache,
         )
 
-        # Try to update the state 5 consecutive time
-        for i in range(5):
-            # Update the internal build state using Phabricator infos
-            phabricator.update_state(build)
+        # Update the internal build state using Phabricator infos
+        # No need to retry: the revision was already loaded when the build target was found
+        phabricator.update_state(build)
 
-            # Continue with workflow once the build is public
-            if build.state is PhabricatorBuildState.Public:
-                break
-
-            # Retry later if the build is not yet seen as public
-            logger.warning(
-                "Build is not public, retrying in 30s",
-                build=build,
-                retries_left=build.retries,
-            )
-            time.sleep(30)
-
-        # Make sure the build is now public
+        # Make sure the build is now public, otherwise skip the analysis
         if build.state is not PhabricatorBuildState.Public:
-            raise Exception("Cannot process private builds")
+            logger.warning(
+                "Cannot process private builds, skipping analysis",
+                build=build,
+                state=build.state.name,
+            )
+            return
 
         # When the build is public, load patches from Phabricator
         if not build.stack:
@@ -336,15 +411,43 @@ class Workflow:
         # We'll clone the required repository
         repository.clone()
 
+        parameters = {}
+        if analysis_mode == AnalysisMode.Lint:
+            parameters.update(
+                {
+                    # The code review bot only consumes the results of the
+                    # code-review tasks, which the target tasks method already selects.
+                    "enable_always_target": False,
+                    "target_tasks_method": "codereview",
+                    "optimize_target_tasks": True,
+                }
+            )
+        elif analysis_mode == AnalysisMode.BuildTest:
+            parameters.update(
+                {
+                    "target_tasks_method": "codereview-build-test",
+                    "optimize_target_tasks": True,
+                    # avoid firing unwanted tasks, eg: source-test
+                    "enable_always_target": False,
+                }
+            )
+
         # Apply the stack of patches and push to try
         worker = MercurialWorker()
-        output = worker.run(repository, build)
+        output = worker.run(repository, build, parameters)
+
+        # Cancel any in-progress tasks from an earlier update
+        # This is done after pushing to try to avoid delaying runs of the
+        # new tasks.
+        self.cancel_previous(revision)
 
         # Update index when the patch has been pushed to try
-        self.index(revision, state="pushed_to_try")
+        self.index(
+            revision, state="pushed_to_try", namespace_suffixes=namespace_suffixes
+        )
 
         # Update final state using worker output
-        if self.update_build:
+        if self.update_build and isinstance(revision, PhabricatorRevision):
             publish_analysis_phabricator(output, self.phabricator)
         else:
             logger.info("Skipping Phabricator publication")
@@ -352,41 +455,91 @@ class Workflow:
         # Send Build in progress or errors to Lando
         lando_reporter = self.reporters.get("lando")
         if lando_reporter is not None:
-            publish_analysis_lando(output, lando_reporter.lando_api)
+            publish_analysis_lando(output, lando_reporter.lando_api, analysis_mode)
         else:
             logger.info("Skipping Lando publication")
 
-    def clone_repository(self, revision):
+    def clone_repository(self, revision, issues):
         """
         Clone the repo locally when configured
         On production this should use a Taskcluster cache
+        For Mercurial, only the files with issues are extracted from the repository,
+        as updating the whole working directory is slow
         """
-        if not settings.mercurial_cache:
-            logger.debug("Local clone not required")
-            return
         if self.clone_available:
             logger.debug("Local clone already setup")
             return
 
-        logger.info(
-            "Cloning revision to build issues",
-            repo=revision.base_repository,
-            changeset=revision.head_changeset,
-            dest=settings.mercurial_cache_checkout,
-        )
-        robust_checkout(
-            repo_upstream_url=revision.base_repository,
-            repo_url=revision.head_repository,
-            revision=revision.head_changeset,
-            checkout_dir=settings.mercurial_cache_checkout,
-            sharebase_dir=settings.mercurial_cache_sharebase,
-        )
+        if not settings.mercurial_cache and not settings.git_cache:
+            logger.info("Local clone not required")
+            return
+
+        if isinstance(revision, PhabricatorRevision):
+            # Mercurial clone
+            if not settings.mercurial_cache:
+                raise Exception(
+                    "Mercurial cache directory is not configured, cannot clone"
+                )
+            checkout_dir = settings.mercurial_cache_checkout(revision.base_repository)
+            logger.info(
+                "Cloning mercurial revision to build issues",
+                repo=revision.base_repository,
+                changeset=revision.head_changeset,
+                dest=checkout_dir,
+            )
+            robust_checkout(
+                repo_upstream_url=revision.base_repository,
+                repo_url=revision.head_repository,
+                revision=revision.head_changeset,
+                checkout_dir=checkout_dir,
+                sharebase_dir=settings.mercurial_cache_sharebase,
+                noupdate=True,
+            )
+
+            cat_files(
+                repo_dir=checkout_dir,
+                revision=revision.head_changeset,
+                paths=sorted({issue.path for issue in issues}),
+                output_dir=settings.mercurial_cache_files,
+            )
+        elif isinstance(revision, GithubRevision):
+            # Git clone
+            if not settings.git_cache:
+                raise Exception("Git cache directory is not configured, cannot clone")
+            logger.info(
+                "Cloning mercurial revision to build issues",
+                repo=revision.base_repository,
+                changeset=revision.head_changeset,
+                dest=settings.git_cache,
+            )
+            git_clone(
+                base_repository=revision.base_repository,
+                head_repository=revision.head_repository,
+                revision=revision.head_changeset,
+                destination=settings.git_cache,
+            )
+        else:
+            raise NotImplementedError
+
         self.clone_available = True
 
-    def publish(self, revision, issues, task_failures, notices, reviewers):
+    def publish(
+        self,
+        revision,
+        issues,
+        task_failures,
+        notices,
+        reviewers,
+        analysis_mode: AnalysisMode,
+        namespace_suffixes,
+        publish_to_backend=True,
+    ):
         """
         Publish issues on selected reporters
         """
+        issue_type = get_issue_type(analysis_mode)
+        issues = [i for i in issues if i.type_ == issue_type]
+
         # Publish patches on Taskcluster
         # or write locally for local development
         for patch in revision.improvement_patches:
@@ -398,7 +551,8 @@ class Workflow:
         # Publish issues on backend to retrieve their comparison state
         publishable_issues = [i for i in issues if i.is_publishable()]
 
-        self.backend_api.publish_issues(publishable_issues, revision)
+        if publish_to_backend:
+            self.backend_api.publish_issues(publishable_issues, revision)
 
         # Report issues publication stats
         nb_issues = len(issues)
@@ -412,16 +566,23 @@ class Workflow:
             state="analyzed",
             issues=nb_issues,
             issues_publishable=nb_publishable,
+            namespace_suffixes=namespace_suffixes,
         )
         stats.add_metric("analysis.issues.publishable", nb_publishable)
 
         # Publish reports about these issues
         with stats.timer("runtime.reports"):
             for reporter in self.reporters.values():
-                reporter.publish(issues, revision, task_failures, notices, reviewers)
+                reporter.publish(
+                    issues, revision, task_failures, notices, reviewers, analysis_mode
+                )
 
         self.index(
-            revision, state="done", issues=nb_issues, issues_publishable=nb_publishable
+            revision,
+            state="done",
+            issues=nb_issues,
+            issues_publishable=nb_publishable,
+            namespace_suffixes=namespace_suffixes,
         )
 
         # Publish final HarborMaster state
@@ -432,7 +593,245 @@ class Workflow:
             else BuildState.Pass,
         )
 
-    def index(self, revision, **kwargs):
+    def cancel_previous(self, revision):
+        """
+        Cancel the code-review task, try pushes, and HarborMaster buildables of earlier
+        updates of a revision.
+        """
+
+        # In order to cancel tasks from a previous push we need the task group id
+        # that the tasks ran under (which is the same as the decision task for that push).
+        # The only way to retrieve this through the Phabricator API is by a long series
+        # of requests:
+        # * Find all of the prior Build Targets (via builds, via buildables)
+        # * Find the log for each Build Target, which will contain a taskId of Code Review task
+        # * Pull the Code Review task log to fetch the treeherder link with the revision pushed to Try in it
+        # * Look up the decision task id in the task index via the revision
+        #
+        # (Despite the fact that the Phabricator UI shows the treeherder link in it, this is
+        #  not available through the API, so we have to take the long way to get here.)
+        try:
+            buildable_phids = self.list_previous_buildables(revision)
+        except Exception as e:
+            logger.warn(
+                "Failed to find previous buildables",
+                rev=str(revision),
+                error=str(e),
+            )
+            return
+
+        try:
+            task_ids = self.find_previous_task_ids(revision, buildable_phids)
+        except Exception as e:
+            logger.warn(
+                "Failed to find previous publication tasks",
+                rev=str(revision),
+                error=str(e),
+            )
+            task_ids = []
+
+        for task_id in task_ids:
+            # cancel the publication task, which may or may not be running still
+            try:
+                self.queue_service.cancelTask(task_id)
+                logger.info("Cancelled a previous publication task", task=task_id)
+            except Exception as e:
+                logger.warn(
+                    "Failed to cancel a previous publication task",
+                    task=task_id,
+                    error=str(e),
+                )
+
+            # No need to check whether or not anything is active in the group;
+            # cancelling is idempotent.
+            task_group_id = self.find_try_decision_task(task_id)
+            if task_group_id is None:
+                continue
+
+            try:
+                # task groups must be sealed before they can be cancelled
+                self.queue_service.sealTaskGroup(task_group_id)
+                self.queue_service.cancelTaskGroup(task_group_id)
+            except Exception as e:
+                logger.warn(
+                    "Failed to cancel a previous try push",
+                    task_group_id=task_group_id,
+                    error=str(e),
+                )
+                continue
+
+            logger.info("Cancelled a previous try push", task_group_id=task_group_id)
+
+        for buildable_phid in buildable_phids:
+            try:
+                # This is safe to do even for completed buildables; the abort
+                # requests will simply be ignored in this case.
+                self.phabricator.request(
+                    "harbormaster.sendmessage",
+                    receiver=buildable_phid,
+                    type="abort",
+                )
+            except Exception as e:
+                logger.warn(
+                    "Failed to abort a previous buildable",
+                    buildable_phid=buildable_phid,
+                    error=str(e),
+                )
+                continue
+
+            logger.info(
+                "Requested an abort of a previous buildable",
+                buildable_phid=buildable_phid,
+            )
+
+    def list_previous_buildables(self, revision):
+        """
+        List the HarborMaster buildables of the previous updates of a revision
+
+        Only the buildables of the diffs preceding the one being processed are
+        returned. The buildable of the current diff is left out because aborting
+        it would abort the build this very task is reporting to, and those of
+        later diffs because they belong to updates that are themselves busy
+        superseding this one.
+        """
+        logger.debug("Finding previous buildables", phid=revision.phabricator_phid)
+        buildables = self.phabricator.request(
+            "harbormaster.buildable.search",
+            constraints={"containerPHIDs": [revision.phabricator_phid]},
+        )["data"]
+
+        diff_phids = {buildable["fields"]["objectPHID"] for buildable in buildables} - {
+            revision.diff_phid
+        }
+        if not diff_phids:
+            logger.debug("No previous buildables found", phid=revision.phabricator_phid)
+            return []
+
+        diff_ids = {
+            diff["phid"]: diff["id"]
+            for diff in self.phabricator.request(
+                "differential.diff.search",
+                constraints={"phids": sorted(diff_phids)},
+            )["data"]
+        }
+
+        buildable_phids = []
+        for buildable in buildables:
+            diff_id = diff_ids.get(buildable["fields"]["objectPHID"])
+            if diff_id is not None and diff_id < revision.diff_id:
+                buildable_phids.append(buildable["phid"])
+
+        if not buildable_phids:
+            logger.debug("No previous buildables found", phid=revision.phabricator_phid)
+            return []
+
+        logger.debug(
+            "Found buildables",
+            phid=revision.phabricator_phid,
+            buildables=buildable_phids,
+        )
+        return buildable_phids
+
+    def find_previous_task_ids(self, revision, buildable_phids):
+        """
+        List the publication task ids found in the build logs of some buildables.
+        """
+        if not buildable_phids:
+            return []
+
+        builds = self.phabricator.request(
+            "harbormaster.build.search",
+            constraints={"buildables": buildable_phids},
+        )["data"]
+        if not builds:
+            logger.debug("No builds found", buildables=buildable_phids)
+            return []
+
+        build_phids = [b["phid"] for b in builds]
+
+        logger.debug("Found builds", buildables=buildable_phids, builds=build_phids)
+        targets = self.phabricator.request(
+            "harbormaster.target.search",
+            constraints={"buildPHIDs": build_phids},
+        )["data"]
+        if not targets:
+            return []
+
+        build_target_phids = [target["phid"] for target in targets]
+
+        logger.debug(
+            "Found build targets", builds=build_phids, build_targets=build_target_phids
+        )
+
+        logs = self.phabricator.request(
+            "harbormaster.log.search",
+            constraints={"buildTargetPHIDs": build_target_phids},
+        )["data"]
+
+        task_ids = []
+        for log in logs:
+            phid = log["fields"]["filePHID"]
+            logger.debug("Downloading log", file=phid)
+            blob = self.phabricator.request("file.download", phid=phid)
+            try:
+                payload = json.loads(base64.b64decode(blob).decode("utf-8", "replace"))
+            except (TypeError, ValueError):
+                logger.debug("Couldn't parse log", file=phid)
+                continue
+
+            if not isinstance(payload, dict):
+                logger.debug("Log is not an object", file=phid)
+                continue
+
+            task_id = payload.get("taskId")
+            if not task_id:
+                logger.debug("Couldn't find task id", file=phid)
+                continue
+
+            if task_id not in task_ids:
+                task_ids.append(task_id)
+
+        return task_ids
+
+    def find_try_decision_task(self, publication_task_id):
+        """
+        Find the decision task of the try push made by a publication task
+
+        The Treeherder link it published is only available in its own backing
+        log, so this is only usable once that task has resolved.
+        """
+        url = self.queue_service.buildUrl(
+            "getLatestArtifact", publication_task_id, PUBLICATION_LOG_ARTIFACT
+        )
+        # Allows HTTP_30x redirections retrieving the artifact
+        response = self.queue_service.session.get(
+            url, stream=True, allow_redirects=True
+        )
+        if not response.ok:
+            logger.warn(
+                "Failed to read the log of a publication task",
+                task=publication_task_id,
+                error=response.status_code,
+            )
+            return
+
+        match = TREEHERDER_LINK_REGEX.search(response.content)
+        if match is None:
+            logger.info(
+                "No try push found for a publication task", task=publication_task_id
+            )
+            return
+
+        route = DECISION_TASK_ROUTE.format(
+            repo=match.group("repo").decode("utf-8"),
+            revision=match.group("revision").decode("utf-8"),
+        )
+        try:
+            return self.index_service.findTask(route)["taskId"]
+        except Exception as e:
+            logger.warn("Failed to find a decision task", route=route, error=str(e))
+
+    def index(self, revision, namespace_suffixes=None, **kwargs):
         """
         Index current task on Taskcluster index
         """
@@ -452,7 +851,6 @@ class Workflow:
 
         # Always add the source and try config
         payload["source"] = "try"
-        payload["try_task_id"] = settings.try_task_id
         payload["try_group_id"] = settings.try_group_id
 
         # Add the repository we are working on for Phabricator revisions
@@ -465,11 +863,23 @@ class Workflow:
             "error_code"
         ) in ("watchdog", "mercurial")
 
+        # Apply namespace suffixes if supplied
+        if namespace_suffixes:
+            namespaces = []
+            for suffix in namespace_suffixes:
+                if suffix != "":
+                    namespaces.extend(
+                        [f"{namespace}.{suffix}" for namespace in revision.namespaces]
+                    )
+                else:
+                    namespaces.extend(revision.namespaces)
+        else:
+            namespaces = revision.namespaces
+
         # Add a sub namespace with the task id to be able to list
         # tasks from the parent namespace
-        namespaces = revision.namespaces + [
-            f"{namespace}.{settings.taskcluster.task_id}"
-            for namespace in revision.namespaces
+        namespaces = namespaces + [
+            f"{namespace}.{settings.taskcluster.task_id}" for namespace in namespaces
         ]
 
         # Build complete namespaces list, with monitoring update
@@ -490,7 +900,7 @@ class Workflow:
                 },
             )
 
-    def find_previous_issues(self, issues, base_rev_changeset=None):
+    def find_previous_issues(self, revision, issues, base_rev_changeset=None):
         """
         Look for known issues in the backend matching the given list of issues
 
@@ -503,24 +913,44 @@ class Workflow:
 
         current_date = datetime.now().strftime("%Y-%m-%d")
 
-        # Group issues by path, so we only list know issues for the affected files
-        issues_groups = groupby(
-            sorted(issues, key=lambda i: i.path),
-            lambda i: i.path,
-        )
+        # Group issues by path, so we only list known issues for the affected files
+        issues_by_path = defaultdict(list)
+        for issue in issues:
+            issues_by_path[issue.path].append(issue)
         logger.info(
             "Checking for existing issues in the backend",
             base_revision_changeset=base_rev_changeset,
         )
 
-        for path, group_issues in issues_groups:
+        if isinstance(revision, PhabricatorRevision):
+            repository_slug = "mozilla-central"
+        elif isinstance(revision, GithubRevision):
+            # TODO: Rely on the central repository for known issues
+            repository_slug = revision.repository_slug
+        else:
+            raise NotImplementedError
+
+        def _list_known_hashes(path):
             known_issues = self.backend_api.list_repo_issues(
-                "mozilla-central",
+                repository_slug,
                 date=current_date,
                 revision_changeset=base_rev_changeset,
                 path=path,
             )
-            hashes = [issue["hash"] for issue in known_issues]
+            return {issue["hash"] for issue in known_issues}
+
+        # Each path needs its own paginated request to the backend, and those
+        # requests are independent, so run them in parallel
+        with ThreadPoolExecutor(
+            max_workers=settings.backend_parallel_requests
+        ) as executor:
+            known_hashes = dict(
+                zip(issues_by_path, executor.map(_list_known_hashes, issues_by_path))
+            )
+
+        # Issues are updated from the main thread only
+        for path, group_issues in issues_by_path.items():
+            hashes = known_hashes[path]
             for issue in group_issues:
                 issue.new_issue = bool(issue.hash and issue.hash not in hashes)
 
@@ -541,9 +971,15 @@ class Workflow:
             rev is not None
         ), "Stopping early because revision could not be created nor retrieved from the backend"
 
+        task = None
+        for t in tasks.values():
+            if t["task"]["metadata"]["name"] == "code-review-issues":
+                task = t
+                break
+        else:
+            assert False, "No code-review-issues task"
+
         # Load task description
-        task = tasks.get(settings.try_task_id)
-        assert task is not None, f"Missing task {settings.try_task_id}"
         dependencies = task["task"]["dependencies"]
         assert len(dependencies) > 0, "No task dependencies to analyze"
 
@@ -604,7 +1040,7 @@ class Workflow:
                         for patch in task_patches:
                             revision.add_improvement_patch(task, patch)
 
-                    elif isinstance(task, NoticeTask):
+                    if isinstance(task, NoticeTask):
                         notice = task.build_notice(artifacts, revision)
                         if notice:
                             notices.append(notice)
@@ -640,6 +1076,66 @@ class Workflow:
         )
         return issues, task_failures, notices, reviewers
 
+    def find_build_test_issues(self, revision, group_id):
+        tasks = {}
+
+        def _load_tasks(page):
+            assert "tasks" in page
+            tasks.update({task["status"]["taskId"]: task for task in page["tasks"]})
+
+        self.queue_service.listTaskGroup(group_id, paginationHandler=_load_tasks)
+        assert len(tasks) > 0
+        logger.info("Loaded Taskcluster group", id=group_id, tasks=len(tasks))
+
+        issues = []
+        task_failures = []
+        notices = []
+        reviewers = []
+        analysis_tasks = []
+
+        try:
+            for taskId, status in tasks.items():
+                if not status["status"]["runs"]:
+                    continue
+
+                task = self.build_task(status)
+                if task is None:
+                    continue
+
+                if task.state == "exception":
+                    if task.status["runs"][-1].get("reasonResolved") != "canceled":
+                        task_failures.append(task)
+                    continue
+
+                if isinstance(task, AnalysisTask):
+                    analysis_tasks.append(task)
+
+            def _analyze_task(task):
+                artifacts = task.load_artifacts(self.queue_service)
+                task_issues = task.parse_issues(artifacts, revision)
+                logger.info(
+                    f"Found {len(task_issues)} issues",
+                    task=task.name,
+                    id=task.id,
+                )
+                return task_issues
+
+            with ThreadPoolExecutor(
+                max_workers=settings.taskcluster_parallel_requests
+            ) as executor:
+                for task_issues in executor.map(_analyze_task, analysis_tasks):
+                    issues += task_issues
+
+        except Exception as e:
+            logger.warn(
+                "Failure during build test analysis",
+                task=settings.try_group_id,
+                error=e,
+            )
+            raise
+
+        return issues, task_failures, notices, reviewers
+
     def build_task(self, task_status):
         """
         Create a specific implementation of AnalysisTask according to the task name
@@ -653,10 +1149,8 @@ class Workflow:
         except KeyError:
             raise Exception(f"Cannot read task name {task_id}")
 
-        # Default format is used first when the correct artifact is available
-        if DefaultTask.matches(task_id):
-            return DefaultTask(task_id, task_status)
-        elif name.startswith("source-test-mozlint-"):
+        # Specific tasks detections are enabled first, default format is used as a fallback
+        if name.startswith("source-test-mozlint-"):
             return MozLintTask(task_id, task_status)
         elif name == "source-test-clang-tidy":
             return ClangTidyTask(task_id, task_status)
@@ -668,23 +1162,32 @@ class Workflow:
             return ExternalTidyTask(task_id, task_status)
         elif name == "source-test-taskgraph-diff":
             return TaskGraphDiffTask(task_id, task_status)
+        elif name.startswith("build-") and not name.startswith("build-docker-image-"):
+            return BuildTask(task_id, task_status)
+        elif DefaultTask.matches(task_id):
+            return DefaultTask(task_id, task_status)
 
     def update_status(self, revision, state):
         """
         Update build status on HarborMaster
         """
-        if not isinstance(revision, PhabricatorRevision):
-            raise NotImplementedError(
-                "Only Phabricator revisions are supported for now"
-            )
+        if isinstance(revision, GithubRevision):
+            logger.warning("No Lando publication for Github yet")
+            return
+
         assert isinstance(state, BuildState)
+
+        # Skip github status update, as we rely on the github reporter for publication
+        if isinstance(revision, GithubRevision):
+            return
+
         if not revision.build_target_phid:
             logger.info(
                 "No build target found, skipping HarborMaster update", state=state.value
             )
             return
 
-        if not self.update_build:
+        if not self.update_build or not isinstance(revision, PhabricatorRevision):
             logger.info(
                 "Update build disabled, skipping HarborMaster update", state=state.value
             )
@@ -701,6 +1204,7 @@ class Workflow:
             raise NotImplementedError(
                 "Only Phabricator revisions are supported for now"
             )
+
         if not revision.build_target_phid:
             logger.info(
                 "No build target found, skipping HarborMaster link creation",
@@ -717,6 +1221,24 @@ class Workflow:
             )
             return
 
-        self.phabricator.create_harbormaster_uri(
-            revision.build_target_phid, slug, name, url
-        )
+        try:
+            self.phabricator.create_harbormaster_uri(
+                revision.build_target_phid, slug, name, url
+            )
+        except ConduitError as e:
+            if e.error_info and "Duplicate entry" in e.error_info:
+                logger.warning(
+                    "Harbormaster URI artifact already exists, skipping creation (retry?)",
+                    slug=slug,
+                    url=url,
+                )
+            else:
+                logger.warn(
+                    "Failed to publish a URI on harbormaster",
+                    build=revision.build_target_phid,
+                    slug=slug,
+                    name=name,
+                    url=url,
+                    error=str(e),
+                )
+                raise

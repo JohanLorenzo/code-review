@@ -4,9 +4,20 @@
 
 import json
 import tempfile
+import time
+from unittest import mock
 
-from code_review_bot import mercurial
-from code_review_bot.config import RepositoryConf
+import pytest
+from libmozdata.phabricator import ConduitError
+
+from code_review_bot import IssueType, mercurial
+from code_review_bot.analysis import (
+    AnalysisMode,
+    get_issue_type,
+    get_test_mode_string,
+    publish_analysis_phabricator,
+)
+from code_review_bot.config import PHABRICATOR_POLL_DELAYS, RepositoryConf
 from code_review_bot.revisions import PhabricatorRevision
 from code_review_bot.sources.phabricator import PhabricatorActions
 
@@ -53,6 +64,127 @@ def test_revision(mock_phabricator):
     assert revision.repository_try_name == "try"
 
 
+@pytest.mark.parametrize(
+    "analysis_mode, expected",
+    [
+        (AnalysisMode.Lint, "Static analysis and linting"),
+        (AnalysisMode.BuildTest, "Builds and tests"),
+    ],
+)
+def test_get_test_mode_string(analysis_mode, expected):
+    assert get_test_mode_string(analysis_mode) == expected
+
+
+@pytest.mark.parametrize(
+    "analysis_mode, expected",
+    [
+        (AnalysisMode.Lint, IssueType.Lint),
+        (AnalysisMode.BuildTest, IssueType.BuildTest),
+    ],
+)
+def test_get_issue_type(analysis_mode, expected):
+    assert get_issue_type(analysis_mode) == expected
+
+
+def test_revision_not_public(mock_phabricator, monkeypatch):
+    """
+    A revision whose Harbormaster build cannot be loaded (not public)
+    must not raise, but return None so the caller can stop early
+    """
+    # Avoid waiting between retries
+    sleep_history = []
+    monkeypatch.setattr(time, "sleep", sleep_history.append)
+
+    with mock_phabricator as api:
+        api.find_target_buildable = mock.Mock(
+            side_effect=AssertionError("Build target not found")
+        )
+
+        revision = PhabricatorRevision.from_phabricator_trigger(
+            build_target_phid="PHID-HMBT-private",
+            phabricator=api,
+        )
+
+    assert revision is None
+    assert api.find_target_buildable.call_count == len(PHABRICATOR_POLL_DELAYS) + 1
+    assert sleep_history == list(PHABRICATOR_POLL_DELAYS)
+
+
+def test_workflow_private_build(
+    mock_mercurial_repo,
+    mock_phabricator,
+    mock_workflow,
+    mock_config,
+    tmpdir,
+    monkeypatch,
+):
+    """
+    A build that never becomes public must stop the analysis
+    without raising nor touching the mercurial repository
+    """
+    mock_config.mercurial_cache = tmpdir
+    mock_config.ssh_key = "Dummy Private SSH Key"
+
+    # Capture hg calls
+    hgrun_calls = []
+    monkeypatch.setattr(mercurial, "hg_run", lambda cmd: hgrun_calls.append(cmd))
+
+    # The revision is never visible
+    is_visible = mock.Mock(return_value=False)
+    monkeypatch.setattr(PhabricatorActions, "is_visible", is_visible)
+
+    # Avoid waiting between retries
+    sleep_history = []
+    monkeypatch.setattr(time, "sleep", sleep_history.append)
+
+    with mock_phabricator as api:
+        mock_workflow.phabricator = api
+
+        revision = PhabricatorRevision.from_phabricator_trigger(
+            build_target_phid="PHID-HMBT-test",
+            phabricator=api,
+        )
+
+        assert mock_workflow.start_analysis(revision, AnalysisMode.Lint) is None
+
+    # The visibility was checked only once, without waiting
+    assert is_visible.call_count == 1
+    assert sleep_history == []
+
+    # No clone nor push happened
+    assert hgrun_calls == []
+    assert mock_mercurial_repo._calls == []
+
+    # Reset settings for following tests
+    mock_config.mercurial_cache = None
+    mock_config.ssh_key = None
+
+
+@pytest.mark.parametrize(
+    "analysis_mode, expected_parameters, expected_namespace_suffixes",
+    [
+        (
+            AnalysisMode.Lint,
+            {
+                "enable_always_target": False,
+                "optimize_target_tasks": True,
+                "phabricator_diff": "PHID-HMBT-test",
+                "target_tasks_method": "codereview",
+            },
+            ["", "lint"],
+        ),
+        (
+            AnalysisMode.BuildTest,
+            {
+                "enable_always_target": False,
+                "optimize_target_tasks": True,
+                "phabricator_diff": "PHID-HMBT-test",
+                "target_tasks_method": "codereview-build-test",
+            },
+            ["build-test"],
+        ),
+    ],
+)
 def test_workflow(
     mock_mercurial_repo,
     mock_phabricator,
@@ -60,6 +192,9 @@ def test_workflow(
     mock_config,
     tmpdir,
     monkeypatch,
+    analysis_mode,
+    expected_parameters,
+    expected_namespace_suffixes,
 ):
     """
     Validate the creation of a Revision in analysis context
@@ -92,21 +227,34 @@ def test_workflow(
     # Run the analysis on fake revision
     with mock_phabricator as api:
         mock_workflow.phabricator = api
+        mock_workflow.index = mock.Mock()
 
         revision = PhabricatorRevision.from_phabricator_trigger(
             build_target_phid="PHID-HMBT-test",
             phabricator=api,
         )
 
-        mock_workflow.start_analysis(revision)
+        mock_workflow.start_analysis(revision, analysis_mode)
+
+    assert mock_workflow.index.call_args_list == [
+        mock.call(
+            revision, state="analysis", namespace_suffixes=expected_namespace_suffixes
+        ),
+        mock.call(
+            revision,
+            state="pushed_to_try",
+            namespace_suffixes=expected_namespace_suffixes,
+        ),
+    ]
 
     # Check hgrun initial call to clone mozilla central through robust checkout
     assert hgrun_calls == [
         [
             "robustcheckout",
             b"--purge",
-            f"--sharebase={tmpdir}/mozilla-central-shared".encode(),
+            f"--sharebase={tmpdir}/shared".encode(),
             b"--branch=default",
+            b"--noupdate",
             b"--",
             "https://hg.mozilla.org/mozilla-central",
             repo_path,
@@ -117,16 +265,14 @@ def test_workflow(
     try_task = tmpdir / "mozilla-central" / "try_task_config.json"
     assert try_task.exists()
     assert json.load(try_task.open()) == {
-        "parameters": {
-            "optimize_target_tasks": True,
-            "phabricator_diff": "PHID-HMBT-test",
-            "target_tasks_method": "codereview",
-        },
+        "parameters": expected_parameters,
         "version": 2,
     }
 
     # Check all calls made to mercurial repo
     assert mock_mercurial_repo._calls == [
+        # Purge after robustcheckout skipped the update
+        ("rawcommand", [b"purge", b"--all", b"--no-confirm"]),
         # Cleanup
         "cbout",
         "cberr",
@@ -141,8 +287,9 @@ def test_workflow(
             "rawcommand",
             [
                 b"strip",
-                b"--rev=roots(outgoing())",
+                b"--rev=roots(not public())",
                 b"--force",
+                b"--no-backup",
             ],
         ),
         # Pull
@@ -220,3 +367,46 @@ def test_workflow(
     # Reset settings for following tests
     mock_config.mercurial_cache = None
     mock_config.ssh_key = None
+
+
+def test_publish_analysis_phabricator_duplicate_harbormaster_uri():
+    """
+    When create_harbormaster_uri raises a ConduitError due to a duplicate key
+    (e.g. on task retry after worker shutdown), the error should be swallowed
+    and a warning logged instead of crashing the publication task.
+    """
+    build = mock.MagicMock()
+    build.target_phid = "PHID-HMBT-test"
+    build.missing_base_revision = False
+
+    phabricator_api = mock.MagicMock()
+    phabricator_api.create_harbormaster_uri.side_effect = ConduitError(
+        "Duplicate entry",
+        error_code="ERR-CONDUIT-CORE",
+        error_info="Duplicate entry 'uri-VEVIsJOfD0wc' for key 'harbormaster_buildartifact.key_artifact'",
+    )
+
+    payload = ("success", build, {"treeherder_url": "https://treeherder.mozilla.org/"})
+    publish_analysis_phabricator(payload, phabricator_api)
+
+    phabricator_api.create_harbormaster_uri.assert_called_once()
+
+
+def test_publish_analysis_phabricator_reraises_other_conduit_errors():
+    """
+    Non-duplicate ConduitErrors must still propagate.
+    """
+    build = mock.MagicMock()
+    build.target_phid = "PHID-HMBT-test"
+    build.missing_base_revision = False
+
+    phabricator_api = mock.MagicMock()
+    phabricator_api.create_harbormaster_uri.side_effect = ConduitError(
+        "Some other error",
+        error_code="ERR-CONDUIT-CORE",
+        error_info="Some unrelated error",
+    )
+
+    payload = ("success", build, {"treeherder_url": "https://treeherder.mozilla.org/"})
+    with pytest.raises(ConduitError):
+        publish_analysis_phabricator(payload, phabricator_api)

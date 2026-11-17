@@ -6,6 +6,7 @@ import os
 import random
 from abc import ABC
 from datetime import timedelta
+from pathlib import Path
 
 import rs_parsepatch
 import structlog
@@ -82,6 +83,10 @@ class Revision(ABC):
         self.files = []
         self.lines = {}
 
+    def persistent_id(self):
+        """An identifier that is constant across all diffs for the same revision."""
+        raise NotImplementedError
+
     @property
     def namespaces(self):
         raise NotImplementedError
@@ -92,17 +97,21 @@ class Revision(ABC):
         Randomly run the before/after feature depending on a configured ratio.
         All the diffs of a revision must be analysed with or without the feature.
         """
-        if getattr(self, "id", None) is None:
-            logger.debug(
-                "Backend ID must be set to determine if using the before/after feature. Skipping."
-            )
-            return False
         # Set random module pseudo-random seed based on the revision ID to
         # ensure that successive calls to random.random will return deterministic values
-        random.seed(self.id)
-        return random.random() < taskcluster.secrets.get("BEFORE_AFTER_RATIO", 0)
+        random.seed(f"before-after-{self.persistent_id()}")
+        ret = random.random() < taskcluster.secrets.get("BEFORE_AFTER_RATIO", 0)
         # Reset random module seed to prevent deterministic values after calling that function
         random.seed(os.urandom(128))
+        return ret
+
+    @property
+    def build_test_feature(self):
+        random.seed(f"build-test-{self.persistent_id()}")
+        ret = random.random() < taskcluster.secrets.get("BUILD_TEST_ANALYSIS_RATIO", 0)
+        # Reset random module seed to prevent deterministic values after calling that function
+        random.seed(os.urandom(128))
+        return ret
 
     def __repr__(self):
         raise NotImplementedError
@@ -122,7 +131,11 @@ class Revision(ABC):
         patch_stats = rs_parsepatch.get_lines(self.patch)
         assert len(patch_stats) > 0, "Empty patch"
 
-        self.lines = {stat["filename"]: stat["added_lines"] for stat in patch_stats}
+        # Store added lines as sets, as `contains` is called several times per
+        # issue and needs a fast membership test against the patch lines
+        self.lines = {
+            stat["filename"]: set(stat["added_lines"]) for stat in patch_stats
+        }
 
         # Shortcut to files modified
         self.files = self.lines.keys()
@@ -164,6 +177,32 @@ class Revision(ABC):
         # Detect if this issue is in the patch
         lines = set(range(issue.line, issue.line + issue.nb_lines))
         return not lines.isdisjoint(modified_lines)
+
+    def in_touched_files(self, issue):
+        """
+        Check if the issue (path+lines) is in this patch
+        """
+        assert isinstance(issue, Issue)
+        return issue.path in self.files
+
+    def get_file_content(
+        self, file_path: str, local_cache_repository: Path | None = None
+    ):
+        if local_cache_repository:
+            logger.debug("Using the local repository to build issue's hash")
+            try:
+                with (local_cache_repository / file_path).open() as f:
+                    file_content = f.read()
+            except (FileNotFoundError, IsADirectoryError):
+                logger.warning("Failed to find issue's related file", path=file_path)
+                file_content = None
+        else:
+            try:
+                file_content = self.load_file(file_path)
+            except ValueError:
+                # The path is erroneous, consider as empty content
+                file_content = None
+        return file_content
 
     @property
     def has_clang_files(self):
@@ -237,17 +276,33 @@ class Revision(ABC):
         """
         raise NotImplementedError
 
+    def serialize(self):
+        """
+        Outputs a tuple of dicts for revision and diff sent to backend
+        """
+        raise NotImplementedError
+
     @staticmethod
-    def from_try_task(try_task: dict, decision_task: dict, phabricator: PhabricatorAPI):
+    def from_try_decision_task(
+        decision_task: dict, build_target_phid: str, phabricator: PhabricatorAPI
+    ):
         """
-        Load identifiers from Phabricator, using the remote task description
+        Load identifiers from Phabricator or Github, using the remote task description
         """
+        from code_review_bot.revisions.github import GithubRevision
         from code_review_bot.revisions.phabricator import PhabricatorRevision
 
-        # Load build target phid from the task env
-        code_review = try_task["extra"]["code-review"]
+        task_env = decision_task.get("payload", {}).get("env", {})
 
-        # TODO: support github revision here too
-        return PhabricatorRevision.from_try_task(
-            code_review, decision_task, phabricator
-        )
+        if task_env.get("GECKO_REPOSITORY_TYPE") == "git":
+            return GithubRevision(
+                base_repository=task_env["GECKO_BASE_REPOSITORY"],
+                base_changeset=task_env["GECKO_BASE_REV"],
+                head_repository=task_env["GECKO_HEAD_REPOSITORY"],
+                head_changeset=task_env["GECKO_HEAD_REV"],
+                pull_number=int(task_env["GECKO_PULL_REQUEST_NUMBER"]),
+            )
+        else:
+            return PhabricatorRevision.from_try_decision_task(
+                decision_task, build_target_phid, phabricator
+            )

@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from django.conf import settings
+from django.core.exceptions import BadRequest
 from django.db.models import BooleanField, Count, ExpressionWrapper, Prefetch, Q
 from django.db.models.functions import TruncDate
 from django.shortcuts import get_object_or_404
@@ -20,7 +21,6 @@ from code_review_backend.issues.models import (
     LEVEL_ERROR,
     Diff,
     Issue,
-    IssueLink,
     Repository,
     Revision,
 )
@@ -77,10 +77,15 @@ class RevisionViewSet(CreateListRetrieveViewSet):
         # When a revision already exists with that phabricator ID we return its data without creating a new one
         # This value is used by the bot to identify a revision and publish new Phabricator diffs.
         # The phabricator ID can be null (on mozilla-central) so we must always try to create a revision for that case
-        phabricator_id = request.data["phabricator_id"]
-        if phabricator_id is not None:
+        try:
+            provider = request.data["provider"]
+            provider_id = request.data["provider_id"]
+        except KeyError:
+            raise BadRequest("Invalid provider identification")
+        if provider_id is not None:
             if revision := Revision.objects.filter(
-                phabricator_id=phabricator_id
+                provider=provider,
+                provider_id=provider_id,
             ).first():
                 serializer = RevisionSerializer(
                     instance=revision, context={"request": request}
@@ -122,10 +127,6 @@ class DiffViewSet(viewsets.ReadOnlyModelViewSet):
             # Because of the perf. hit filter issues that are not older than today - 3 months.
             .filter(created__gte=date.today() - timedelta(days=90))
             .prefetch_related(
-                Prefetch(
-                    "issue_links",
-                    queryset=IssueLink.objects.select_related("issue"),
-                ),
                 "revision",
                 "revision__base_repository",
                 "revision__head_repository",
@@ -166,7 +167,7 @@ class DiffViewSet(viewsets.ReadOnlyModelViewSet):
         if query is not None:
             search_query = (
                 Q(id__icontains=query)
-                | Q(revision__phabricator_id__icontains=query)
+                | Q(revision__provider_id__icontains=query)
                 | Q(revision__bugzilla_id__icontains=query)
                 | Q(revision__title__icontains=query)
             )
@@ -200,9 +201,9 @@ class IssueViewSet(
 
     def get_queryset(self):
         # Required to generate the OpenAPI documentation
-        if not self.kwargs.get("diff_id"):
+        if not self.kwargs.get("diff_provider_id"):
             return Issue.objects.none()
-        diff = get_object_or_404(Diff, id=self.kwargs["diff_id"])
+        diff = get_object_or_404(Diff, provider_id=self.kwargs["diff_provider_id"])
         return (
             Issue.objects.filter(issue_links__diff=diff)
             .annotate(publishable=Q(issue_links__in_patch=True) & Q(level=LEVEL_ERROR))
@@ -426,7 +427,7 @@ class IssueList(generics.ListAPIView):
     serializer_class = IssueHashSerializer
 
     def get_queryset(self):
-        qs = Issue.objects.all().only("id", "hash").prefetch_related("revisions")
+        qs = Issue.objects.all().only("id", "hash")
 
         errors = defaultdict(list)
         repo_slug = self.kwargs["repo_slug"]
@@ -497,7 +498,9 @@ router.register(
     basename="revision-diffs",
 )
 router.register(r"diff", DiffViewSet, basename="diffs")
-router.register(r"diff/(?P<diff_id>\d+)/issues", IssueViewSet, basename="issues")
+router.register(
+    r"diff/(?P<diff_provider_id>[0-9a-zA-Z-]+)/issues", IssueViewSet, basename="issues"
+)
 urls = router.urls + [
     path(
         "revision/<int:revision_id>/issues/",

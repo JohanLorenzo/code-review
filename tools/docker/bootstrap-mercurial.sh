@@ -1,6 +1,6 @@
 #!/bin/bash -ex
-MERCURIAL_VERSION="6.8.2"
-VERSION_CONTROL_TOOLS_REV="5e36b6028416b2fbefcbee2bb9960c8cacb18caa"
+MERCURIAL_VERSION="7.2.2"
+VERSION_CONTROL_TOOLS_REV="6bf453c1aecd9bd8934a4c8a2b0d9a299bf96e17"
 
 # Check source hgrc is available
 HGRC=/src/tools/docker/hgrc
@@ -10,7 +10,7 @@ if [[ ! -f $HGRC ]]; then
 fi
 
 apt-get update
-apt-get install --no-install-recommends -y curl python-dev-is-python3 gcc openssh-client libjemalloc2
+apt-get install --no-install-recommends -y curl python-dev-is-python3 gcc openssh-client libjemalloc2 git
 
 pip install --disable-pip-version-check --quiet --no-cache-dir mercurial==$MERCURIAL_VERSION
 

@@ -11,7 +11,10 @@ from functools import cached_property
 
 import requests
 import structlog
-from libmozdata.phabricator import LintResult, UnitResult, UnitResultState
+
+# Workaround https://github.com/taskcluster/taskcluster/issues/9172
+import taskcluster.download
+from libmozdata.phabricator import LintResult
 from taskcluster.helper import TaskclusterConfig
 
 from code_review_bot.config import settings
@@ -63,26 +66,16 @@ class Level(enum.Enum):
     Warning = "warning"
 
 
-class Issue(abc.ABC):
-    """
-    Common reported issue interface
-    """
+class IssueType(enum.Enum):
+    Lint = 1
+    BuildTest = 2
 
-    revision = None
+
+class BaseIssue(abc.ABC):
+    type_: IssueType
 
     def __init__(
-        self,
-        analyzer: AnalysisTask,
-        revision,
-        path: str,
-        line: int,
-        nb_lines: int,
-        check: str,
-        column: int = None,
-        message: str = None,
-        level: Level = Level.Warning,
-        fix: str = None,
-        language: str = None,
+        self, analyzer, revision, level: Level = Level.Warning, message: str = ""
     ):
         # Check while avoiding circular dependencies
         from code_review_bot.revisions import Revision
@@ -90,41 +83,15 @@ class Issue(abc.ABC):
         assert isinstance(revision, Revision)
         assert isinstance(analyzer, AnalysisTask)
 
-        # Base required fields for all issues
-        assert not os.path.isabs(path), f"Issue path can not be absolute {path}"
-        self.revision = revision
         self.analyzer = analyzer
-        self.check = check
-        self.path = path
-        self.line = positive_int("line", line)
-        self.nb_lines = positive_int("nb_lines", nb_lines)
-
-        # Support line 0 for full file issues like `source-test-mozlint-test-manifest`.
-        if self.line == 0:
-            logger.info("Line 0 is not supported, falling back to full file issue")
-            self.line = None
-
-        # Optional common fields
-        self.column = column
-        self.message = message
+        self.revision = revision
         self.level = level
-
-        # Reserved payload for backend
-        self.on_backend = None
-
-        # Store information when a fix is available
-        self.fix = fix
-        self.language = language
-        if self.fix is not None:
-            assert self.language is not None, "Missing fix language"
-
+        self.message = message
         # Mark the issue as known by default, so only errors are reported
         # The before/after feature may tag some issues as new, so they are reported
         self.new_issue = False
-
-    def __str__(self):
-        line = f"line {self.line}" if self.line is not None else "full file"
-        return f"{self.analyzer.name} issue {self.check}@{self.level.value} {self.path} {line}"
+        # Reserved payload for backend
+        self.on_backend = None
 
     @property
     def display_name(self):
@@ -153,6 +120,135 @@ class Issue(abc.ABC):
 
         return self.revision.before_after_feature
 
+    @cached_property
+    def hash(self):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def is_publishable(self):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def validates(self):
+        """
+        Is this issue publishable on reporters using IN_PATCH publication ?
+        Should check specific rules and return a boolean
+        """
+        raise NotImplementedError
+
+    def as_dict(self):
+        """
+        Build the serializable dict representation of the issue
+        Used by debugging tools
+        """
+        issue_hash = None
+        try:
+            issue_hash = self.hash
+        except Exception as e:
+            logger.warn("Failed to build issue hash", error=str(e), issue=str(self))
+
+        return {
+            "analyzer": self.analyzer.name,
+            "level": self.level.value,
+            "message": self.message,
+            "validates": self.validates(),
+            "publishable": self.is_publishable(),
+            "hash": issue_hash,
+        }
+
+    @abc.abstractmethod
+    def as_text(self):
+        """
+        Build the text content for reporters
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def as_markdown(self):
+        """
+        Build the Markdown content for debug email
+        """
+        raise NotImplementedError
+
+    def as_error(self):
+        """
+        Build the Markdown content for for build error issues
+        """
+        raise NotImplementedError
+
+    def as_error_details(self, collapsible=False):
+        return ""
+
+    @abc.abstractmethod
+    def is_build_error(self) -> bool:
+        """
+        Is this issue a build error?
+        Default is False
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def as_phabricator_issue(self):
+        raise NotImplementedError
+
+
+class Issue(BaseIssue):
+    """
+    Common reported issue interface
+    """
+
+    type_: IssueType = IssueType.Lint
+    revision = None
+
+    def __init__(
+        self,
+        analyzer: AnalysisTask,
+        revision,
+        path: str,
+        line: int,
+        nb_lines: int,
+        check: str,
+        column: int = None,
+        message: str = "",
+        level: Level = Level.Warning,
+        fix: str = None,
+        language: str = None,
+    ):
+        super().__init__(analyzer, revision, level, message)
+
+        # Base required fields for all issues
+        assert not os.path.isabs(path), f"Issue path can not be absolute {path}"
+        self.check = check
+        self.path = path
+        self.line = positive_int("line", line)
+        self.nb_lines = positive_int("nb_lines", nb_lines)
+
+        # Support line 0 for full file issues like `source-test-mozlint-test-manifest`.
+        if self.line == 0:
+            logger.info("Line 0 is not supported, falling back to full file issue")
+            self.line = None
+
+        # Optional common fields
+        self.column = column
+
+        # Store information when a fix is available
+        self.fix = fix
+        self.language = language
+        if self.fix is not None:
+            assert self.language is not None, "Missing fix language"
+
+    def __str__(self):
+        line = f"line {self.line}" if self.line is not None else "full file"
+        return f"{self.analyzer.name} issue {self.check}@{self.level.value} {self.path} {line}"
+
+    @property
+    def in_patch(self):
+        return self.revision.contains(self)
+
+    @property
+    def in_touched_files(self):
+        return self.revision.in_touched_files(self)
+
     def is_publishable(self):
         """
         Is this issue publishable on reporters ?
@@ -178,10 +274,6 @@ class Issue(abc.ABC):
         # Fallback to in_patch detection
         return self.in_patch
 
-    @property
-    def in_patch(self):
-        return self.revision.contains(self)
-
     @cached_property
     def hash(self):
         """
@@ -191,41 +283,27 @@ class Issue(abc.ABC):
         We make the assumption that the message does not contain the line number
         If an error occurs reading the file content (locally or remotely), None is returned
         """
+        from code_review_bot.revisions import GithubRevision, PhabricatorRevision
+
         assert self.revision is not None, "Missing revision"
+
+        local_repository = None
+        if isinstance(self.revision, PhabricatorRevision):
+            local_repository = settings.mercurial_cache_files
+        elif isinstance(self.revision, GithubRevision):
+            assert (
+                settings.git_cache
+            ), "Github cache repository is mandatory to analyse a github revision"
+            local_repository = settings.git_cache / self.revision.repository_slug
+        else:
+            raise NotImplementedError(self.revision.__class__)
 
         # Build the hash only if the file is not autogenerated.
         # An autogenerated file resides in the build directory that it has the
         #  format `obj-x86_64-pc-linux-gnu`
         file_content = None
-        if "/obj-" not in self.path:
-            if settings.mercurial_cache_checkout:
-                logger.debug("Using the local repository to build issue's hash")
-                try:
-                    with (settings.mercurial_cache_checkout / self.path).open() as f:
-                        file_content = f.read()
-                except (FileNotFoundError, IsADirectoryError):
-                    logger.warning(
-                        "Failed to find issue's related file", path=self.path
-                    )
-                    file_content = None
-            else:
-                try:
-                    # Load all the lines affected by the issue
-                    file_content = self.revision.load_file(self.path)
-                except ValueError:
-                    # Build the hash with an empty content in case the path is erroneous
-                    file_content = None
-                except requests.exceptions.HTTPError as e:
-                    if e.response.status_code == 404:
-                        logger.warning(
-                            "Failed to download a file with an issue", path=self.path
-                        )
-
-                        # We still build the hash with empty content
-                        file_content = None
-                    else:
-                        # When encountering another HTTP error, raise the issue
-                        raise
+        if "obj-" not in self.path:
+            file_content = self.revision.get_file_content(self.path, local_repository)
 
         if file_content is None:
             self._hash = None
@@ -269,11 +347,16 @@ class Issue(abc.ABC):
         """
         Check if the file that generated the issue still exists after applying the patch.
         """
-        if settings.mercurial_cache_checkout:
+        from code_review_bot.revisions import PhabricatorRevision
+
+        if (
+            isinstance(self.revision, PhabricatorRevision)
+            and settings.mercurial_cache_files
+        ):
             logger.debug(
-                "Using the local repository to check if the file that caused the issue still exists."
+                "Using the files extracted from the local repository to check if the file that caused the issue still exists."
             )
-            return (settings.mercurial_cache_checkout / self.path).exists()
+            return (settings.mercurial_cache_files / self.path).exists()
         else:
             # It is not possible to use revision.has_file directly because it returns files that have been modified
             try:
@@ -284,62 +367,23 @@ class Issue(abc.ABC):
                     raise e
                 return False
 
-    @abc.abstractmethod
-    def validates(self):
-        """
-        Is this issue publishable on reporters using IN_PATCH publication ?
-        Should check specific rules and return a boolean
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def as_text(self):
-        """
-        Build the text content for reporters
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def as_markdown(self):
-        """
-        Build the Markdown content for debug email
-        """
-        raise NotImplementedError
-
-    def as_error(self):
-        """
-        Build the Markdown content for for build error issues
-        """
-        raise NotImplementedError
-
     def as_dict(self):
-        """
-        Build the serializable dict representation of the issue
-        Used by debugging tools
-        """
-        issue_hash = None
-        try:
-            issue_hash = self.hash
-        except Exception as e:
-            logger.warn("Failed to build issue hash", error=str(e), issue=str(self))
+        dict_repr = super().as_dict()
+        dict_repr.update(
+            {
+                "path": self.path,
+                "line": self.line,
+                "nb_lines": self.nb_lines,
+                "column": self.column,
+                "check": self.check,
+                "in_patch": self.in_patch,
+                "fix": self.fix,
+            }
+        )
 
-        return {
-            "analyzer": self.analyzer.name,
-            "path": self.path,
-            "line": self.line,
-            "nb_lines": self.nb_lines,
-            "column": self.column,
-            "check": self.check,
-            "level": self.level.value,
-            "message": self.message,
-            "in_patch": self.in_patch,
-            "validates": self.validates(),
-            "publishable": self.is_publishable(),
-            "hash": issue_hash,
-            "fix": self.fix,
-        }
+        return dict_repr
 
-    def as_phabricator_lint(self):
+    def as_phabricator_issue(self):
         """
         Build the Phabricator LintResult instance
         """
@@ -369,27 +413,7 @@ class Issue(abc.ABC):
             char=self.column,
         )
 
-    def as_phabricator_unitresult(self):
-        """
-        Build a Phabricator UnitResult for build errors
-        """
-        assert (
-            self.is_build_error()
-        ), "Only build errors may be published as unit results"
-
-        return UnitResult(
-            namespace="code-review",
-            name="general",
-            result=UnitResultState.Fail,
-            details=f"Code review bot found a **build error**: \n{self.message}",
-            format="remarkup",
-        )
-
     def is_build_error(self):
-        """
-        Is this issue a build error?
-        Default is False
-        """
         return False
 
 

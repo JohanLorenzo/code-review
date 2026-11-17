@@ -108,6 +108,14 @@ bot:
   # the before/after feature (filters out known issues and warn about issues outside the patch)
   BEFORE_AFTER_RATIO: 0.3
 
+  # Number of concurrent requests made to the code review backend, e.g. to list known
+  # issues or publish issues in bulk (defaults to 8)
+  # Can be lowered on instances using a smaller backend
+  BACKEND_PARALLEL_REQUESTS: 8
+
+  # Number of concurrent requests made to Taskcluster, e.g. to load tasks artifacts (defaults to 8)
+  TASKCLUSTER_PARALLEL_REQUESTS: 8
+
   # Connection information to publish issues on the backend
   # On local development it should be set to the local backend running in Docker
   backend:

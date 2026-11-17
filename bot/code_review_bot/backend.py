@@ -3,12 +3,14 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import structlog
 
 from code_review_bot import taskcluster
 from code_review_bot.config import GetAppUserAgent, settings
+from code_review_bot.revisions import PhabricatorRevision
 from code_review_bot.tasks.lint import MozLintIssue
 
 logger = structlog.get_logger(__name__)
@@ -24,7 +26,12 @@ class BackendAPI:
         self.url = configuration.get("url")
         self.username = configuration.get("username")
         self.password = configuration.get("password")
+
+        # Reuse a single session to keep connections alive across requests
+        self.session = requests.Session()
+        self.session.headers.update(GetAppUserAgent())
         if self.enabled:
+            self.session.auth = (self.username, self.password)
             logger.info("Will use backend", url=self.url, user=self.username)
         else:
             logger.info("Skipping backend storage")
@@ -46,39 +53,29 @@ class BackendAPI:
             logger.warn("Skipping revision publication on backend")
             return
 
-        # Check the repositories are urls
-        for url in (revision.base_repository, revision.head_repository):
-            assert isinstance(url, str), "Repository must be a string"
-            res = urllib.parse.urlparse(url)
-            assert res.scheme and res.netloc, f"Repository {url} is not an url"
+        elif isinstance(revision, PhabricatorRevision):
+            # Check the repositories are urls
+            for url in (revision.base_repository, revision.head_repository):
+                assert isinstance(url, str), "Repository must be a string"
+                res = urllib.parse.urlparse(url)
+                assert res.scheme and res.netloc, f"Repository {url} is not an url"
 
-        # Check the Mercurial changesets are strings
-        for changeset in (
-            revision.base_changeset,
-            revision.head_changeset,
-        ):
-            assert isinstance(changeset, str), "Mercurial changeset must be a string"
+            # Check the Mercurial changesets are strings
+            for changeset in (
+                revision.base_changeset,
+                revision.head_changeset,
+            ):
+                assert isinstance(
+                    changeset, str
+                ), "Mercurial changeset must be a string"
 
-        # Create revision on backend if it does not exists
-        data = {
-            "phabricator_id": revision.phabricator_id,
-            "phabricator_phid": revision.phabricator_phid,
-            "title": revision.title,
-            "bugzilla_id": revision.bugzilla_id,
-            "base_repository": revision.base_repository,
-            "head_repository": revision.head_repository,
-            "base_changeset": revision.base_changeset,
-            "head_changeset": revision.head_changeset,
-        }
+        revision_data, diff_data = revision.serialize()
 
-        # Try to create the revision, or retrieve it in case it exists with that Phabricator ID.
+        # Try to create the revision, or retrieve it in case it exists with that provider and ID.
         # The backend always returns a revisions, either a new one, or a pre-existing one
         revision_url = "/v1/revision/"
-        auth = (self.username, self.password)
         url_post = urllib.parse.urljoin(self.url, revision_url)
-        response = requests.post(
-            url_post, headers=GetAppUserAgent(), json=data, auth=auth
-        )
+        response = self.session.post(url_post, json=revision_data)
         if not response.ok:
             logger.warn(f"Backend rejected the payload: {response.content}")
             return
@@ -87,17 +84,14 @@ class BackendAPI:
         revision.issues_url = backend_revision["issues_bulk_url"]
         revision.id = backend_revision["id"]
 
-        # A revision may have no diff (e.g. Mozilla-central group tasks)
-        if not revision.diff_id:
+        # A revision may have no diff (e.g. Phabricator Mozilla-central group tasks)
+        if isinstance(revision, PhabricatorRevision) and not revision.diff_id:
             return backend_revision
 
         # Create diff attached to revision on backend
         data = {
-            "id": revision.diff_id,
-            "phid": revision.diff_phid,
+            **diff_data,
             "review_task_id": settings.taskcluster.task_id,
-            "mercurial_hash": revision.head_changeset,
-            "repository": revision.head_repository,
         }
         backend_diff = self.create(backend_revision["diffs_url"], data)
 
@@ -125,6 +119,10 @@ class BackendAPI:
             issues[i : i + settings.bulk_issue_chunks]
             for i in range(0, len(issues), settings.bulk_issue_chunks)
         )
+
+        # Build the payload of every chunk first, from the main thread,
+        # as serializing an issue may read its file to compute the hash
+        chunks_data = []
         for issues_chunk in chunks:
             # Store valid data as couples of (<issue>, <json_data>)
             valid_data = []
@@ -155,10 +153,21 @@ class BackendAPI:
                 )
                 continue
 
-            response = self.create(
+            chunks_data.append(valid_data)
+
+        # Post all the chunks in parallel, as the backend handles each one independently
+        def _create_chunk(valid_data):
+            return self.create(
                 revision.issues_url,
                 {"issues": [json_data for _, json_data in valid_data]},
             )
+
+        with ThreadPoolExecutor(
+            max_workers=settings.backend_parallel_requests
+        ) as executor:
+            responses = list(executor.map(_create_chunk, chunks_data))
+
+        for valid_data, response in zip(chunks_data, responses):
             if response is None:
                 # Backend rejected the payload, nothing more to do.
                 continue
@@ -191,12 +200,11 @@ class BackendAPI:
         """
         Yield results from a paginated API one by one
         """
-        auth = (self.username, self.password)
         next_url = urllib.parse.urljoin(self.url, url_path)
 
         # Iterate until there is no page left or a status error happen
         while next_url:
-            resp = requests.get(next_url, auth=auth, headers=GetAppUserAgent())
+            resp = self.session.get(next_url)
             resp.raise_for_status()
             data = resp.json()
             yield from data.get("results", [])
@@ -209,21 +217,18 @@ class BackendAPI:
         """
         assert self.enabled is True, "Backend API is not enabled"
         assert url_path.endswith("/")
-        auth = (self.username, self.password)
 
         if "id" in data:
             # Check that the item does not already exists
             url_get = urllib.parse.urljoin(self.url, f"{url_path}{data['id']}/")
-            response = requests.get(url_get, auth=auth, headers=GetAppUserAgent())
+            response = self.session.get(url_get)
             if response.ok:
                 logger.info("Found existing item on backend", url=url_get)
                 return response.json()
 
         # Create the requested item
         url_post = urllib.parse.urljoin(self.url, url_path)
-        response = requests.post(
-            url_post, headers=GetAppUserAgent(), json=data, auth=auth
-        )
+        response = self.session.post(url_post, json=data)
         if not response.ok:
             logger.warn(f"Backend rejected the payload: {response.content}")
             return None

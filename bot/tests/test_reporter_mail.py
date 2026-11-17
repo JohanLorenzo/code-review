@@ -7,6 +7,7 @@ import json
 import pytest
 import responses
 
+from code_review_bot.analysis import AnalysisMode
 from code_review_bot.tasks.clang_format import ClangFormatTask
 from code_review_bot.tasks.clang_tidy import ClangTidyTask
 
@@ -31,19 +32,6 @@ This is the mock issue n°2
 This is the mock issue n°3
 
 This is the mock issue n°4
-"""
-
-
-MAIL_CONTENT_BUILD_ERRORS = """
-# [Code Review bot](https://github.com/mozilla/code-review) found 2 build errors on [D51](https://phabricator.test/D51)
-
-
-**Message**: ```Unidentified symbol```
-**Location**: some/file/path:0
-
-
-**Message**: ```Unidentified symbol```
-**Location**: some/file/path:1
 """
 
 
@@ -121,12 +109,13 @@ def test_mail(
     list(
         map(lambda p: p.write(), mock_revision.improvement_patches)
     )  # trigger local write
-    r.publish(mock_issues, mock_revision, [], [], [])
+    r.publish(mock_issues, mock_revision, [], [], [], AnalysisMode.Lint)
 
     # Check stats
     assert r.calc_stats(mock_issues) == [
         {
             "analyzer": "mock-analyzer",
+            "log": "https://firefox-ci-tc.services.mozilla.com/api/queue/v1/task/mock-analyzer-ID/runs/0/artifacts/public/logs/live_backing.log",
             "help": None,
             "total": 5,
             "publishable": 3,
@@ -137,36 +126,3 @@ def test_mail(
             "nb_errors": 2,
         }
     ]
-
-
-def test_mail_builderrors(
-    log, mock_config, mock_clang_tidy_issues, mock_revision, mock_taskcluster_config
-):
-    """
-    Test mail_builderrors sending through Taskcluster
-    """
-    from code_review_bot.report.mail_builderrors import BuildErrorsReporter
-
-    def _check_email(request):
-        payload = json.loads(request.body)
-
-        assert payload["subject"] == "Code Review bot found 2 build errors on D51"
-        assert payload["address"] == "test@mozilla.com"
-        assert payload["content"] == MAIL_CONTENT_BUILD_ERRORS
-
-        return (200, {}, "")  # ack
-
-    # Add mock taskcluster email to check output
-    responses.add_callback(
-        responses.POST,
-        "http://taskcluster.test/api/notify/v1/email",
-        callback=_check_email,
-    )
-
-    # Publish email
-    conf = {"emails": ["test@mozilla.com"]}
-    r = BuildErrorsReporter(conf)
-
-    r.publish(mock_clang_tidy_issues, mock_revision, [], [], [])
-
-    assert log.has("Send build error email", to="test@mozilla.com")
